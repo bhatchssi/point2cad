@@ -119,9 +119,9 @@ def read_las(path):
     las = laspy.read(path)
 
     points = np.column_stack([
-        las.x.astype(np.float32),
-        las.y.astype(np.float32),
-        las.z.astype(np.float32),
+        np.array(las.x, dtype=np.float64).astype(np.float32),
+        np.array(las.y, dtype=np.float64).astype(np.float32),
+        np.array(las.z, dtype=np.float64).astype(np.float32),
     ])
 
     labels = None
