@@ -143,180 +143,212 @@ def rasterize(points_2d, resolution=0.02):
 
 
 # ---------------------------------------------------------------------------
-# 4. Wall detection via image processing (scipy only)
+# 4. Wall detection — contour tracing + polyline simplification
 # ---------------------------------------------------------------------------
 
-def detect_walls(image, origin, resolution, min_density=5,
-                 morph_iterations=2, min_line_length=0.3):
+def detect_walls(image, origin, resolution, min_density=3,
+                 morph_iterations=3, min_line_length=0.3,
+                 simplify_tolerance=None):
     """Detect wall segments from the density image.
 
-    Uses morphological operations and connected-component labeling to find
-    wall regions, then fits line segments along each wall cluster.
+    Strategy:
+      1. Threshold the density image to binary.
+      2. Morphological closing + dilation to connect nearby wall pixels and
+         fill scanner gaps.
+      3. Trace the boundary contours of every connected wall region.
+      4. Simplify each contour polyline (Ramer-Douglas-Peucker) to get
+         clean wall segments.
+
+    This produces many more segments than the old skeleton+PCA approach
+    because it follows the actual wall outlines.
 
     Args:
         image: 2D uint8 density image from rasterize().
         origin: (x_min, y_min) world coordinate origin.
         resolution: Grid cell size in metres.
-        min_density: Minimum pixel value to consider as "wall".
-        morph_iterations: Iterations of morphological closing to fill gaps.
+        min_density: Minimum pixel value to consider as "wall" (lowered
+            from 5 to 3 to capture thinner walls).
+        morph_iterations: Iterations of morphological closing.
         min_line_length: Minimum wall segment length in metres.
+        simplify_tolerance: Tolerance for polyline simplification in metres.
+            Default: 2 * resolution (keeps detail while removing noise).
 
     Returns:
         List of ((x1, y1), (x2, y2)) line segments in world coordinates.
     """
     from scipy import ndimage
 
-    # Threshold to binary
+    if simplify_tolerance is None:
+        simplify_tolerance = resolution * 2.0
+
+    # --- Threshold ---
     binary = (image >= min_density).astype(np.uint8)
+    n_wall_px = binary.sum()
+    print(f"  Binary mask: {n_wall_px:,} wall pixels "
+          f"({100*n_wall_px/binary.size:.1f}% of image)")
 
-    # Morphological closing to connect nearby wall points
+    if n_wall_px == 0:
+        print("  WARNING: No wall pixels found. Try lowering --min_density.")
+        return []
+
+    # --- Morphological cleanup ---
     struct = ndimage.generate_binary_structure(2, 2)  # 8-connected
-    binary = ndimage.binary_closing(binary, structure=struct,
-                                     iterations=morph_iterations).astype(np.uint8)
+    # Close gaps between nearby wall points
+    binary = ndimage.binary_closing(
+        binary, structure=struct, iterations=morph_iterations
+    ).astype(np.uint8)
+    # Slight dilation to merge thin parallel scan lines
+    binary = ndimage.binary_dilation(
+        binary, structure=struct, iterations=1
+    ).astype(np.uint8)
 
-    # Thin to skeleton (approximate by erosion-based thinning)
-    skeleton = _skeletonize(binary)
-
-    # Label connected components in the skeleton
-    labeled, n_features = ndimage.label(skeleton, structure=struct)
-    print(f"  Found {n_features} wall segments in skeleton")
-
-    # For each connected component, fit a line segment
-    segments = []
+    # --- Label connected components ---
+    labeled, n_features = ndimage.label(binary, structure=struct)
+    sizes = ndimage.sum(binary, labeled, range(1, n_features + 1))
     min_pixels = max(3, int(min_line_length / resolution))
+    print(f"  {n_features} connected regions "
+          f"(keeping regions >= {min_pixels} px)")
+
+    # --- Trace contours of each region ---
+    all_segments = []
+    regions_used = 0
 
     for label_id in range(1, n_features + 1):
-        ys, xs = np.where(labeled == label_id)
-        if len(xs) < min_pixels:
+        if sizes[label_id - 1] < min_pixels:
+            continue
+        regions_used += 1
+
+        region_mask = (labeled == label_id).astype(np.uint8)
+        contour_points = _trace_contour(region_mask)
+
+        if len(contour_points) < 2:
             continue
 
-        # Convert pixel coords to world coords
-        wx = xs * resolution + origin[0]
-        wy = ys * resolution + origin[1]
+        # Convert pixel coords (row, col) to world coords (x, y)
+        world_pts = np.empty_like(contour_points, dtype=np.float64)
+        world_pts[:, 0] = contour_points[:, 1] * resolution + origin[0]
+        world_pts[:, 1] = contour_points[:, 0] * resolution + origin[1]
 
-        # Fit line segments to this cluster
-        cluster_segments = _fit_line_segments(wx, wy, resolution,
-                                              min_line_length)
-        segments.extend(cluster_segments)
+        # Simplify polyline
+        simplified = _rdp_simplify(world_pts, simplify_tolerance)
+        if len(simplified) < 2:
+            continue
 
-    print(f"  Traced {len(segments)} wall line segments")
-    return segments
+        # Convert polyline vertices to line segments
+        for i in range(len(simplified) - 1):
+            p1, p2 = simplified[i], simplified[i + 1]
+            seg_len = np.linalg.norm(p2 - p1)
+            if seg_len >= min_line_length:
+                all_segments.append(
+                    ((p1[0], p1[1]), (p2[0], p2[1]))
+                )
+
+    print(f"  Traced {len(all_segments)} wall segments "
+          f"from {regions_used} regions")
+    return all_segments
 
 
-def _skeletonize(binary):
-    """Simple morphological skeletonization using scipy.
+def _trace_contour(mask):
+    """Trace the outer boundary of a binary region.
 
-    Repeatedly erodes the image and accumulates the skeleton pixels that
-    would be removed by further erosion.
+    Uses a simple Moore-neighbourhood boundary tracing algorithm.
+    Returns an Nx2 array of (row, col) pixel coordinates forming the contour.
     """
-    from scipy import ndimage
+    # Pad the mask so boundary pixels on the image edge are handled
+    padded = np.pad(mask, 1, mode='constant', constant_values=0)
 
-    skel = np.zeros_like(binary)
-    element = ndimage.generate_binary_structure(2, 2)
-    img = binary.copy()
+    # Find a starting pixel (first nonzero in raster order)
+    rows, cols = np.where(padded > 0)
+    if len(rows) == 0:
+        return np.empty((0, 2), dtype=np.float64)
 
-    while img.any():
-        eroded = ndimage.binary_erosion(img, element)
-        opened = ndimage.binary_dilation(eroded, element)
-        # Pixels in img but not in opened are skeleton pixels
-        skel |= (img & ~opened)
-        img = eroded.astype(np.uint8)
+    start_r, start_c = rows[0], cols[0]
 
-    return skel
+    # 8-connected neighbour offsets (clockwise from top-left)
+    #  5 6 7
+    #  4 . 0
+    #  3 2 1
+    dr = [0, 1, 1,  1,  0, -1, -1, -1]
+    dc = [1, 1, 0, -1, -1, -1,  0,  1]
+
+    contour = [(start_r, start_c)]
+    r, c = start_r, start_c
+    # Enter from the left (direction 4)
+    backtrack_dir = 4
+    max_steps = padded.size  # safety limit
+
+    for _ in range(max_steps):
+        # Search clockwise starting from (backtrack_dir + 1) % 8
+        found = False
+        start_search = (backtrack_dir + 1) % 8
+        for k in range(8):
+            d = (start_search + k) % 8
+            nr, nc = r + dr[d], c + dc[d]
+            if padded[nr, nc]:
+                r, c = nr, nc
+                # Backtrack direction = opposite of the direction we came from
+                backtrack_dir = (d + 4) % 8
+                found = True
+                break
+
+        if not found:
+            break  # isolated pixel
+
+        if r == start_r and c == start_c:
+            break  # completed the loop
+
+        contour.append((r, c))
+
+    # Remove padding offset
+    result = np.array(contour, dtype=np.float64)
+    result -= 1.0
+    return result
 
 
-def _fit_line_segments(wx, wy, resolution, min_length):
-    """Fit line segments to a cluster of wall points.
-
-    Uses PCA to find the principal direction, then projects points onto it
-    to get the extent. For L-shaped or curved walls, splits the cluster
-    into sub-segments.
+def _rdp_simplify(points, tolerance):
+    """Ramer-Douglas-Peucker polyline simplification.
 
     Args:
-        wx, wy: World-coordinate arrays of the cluster points.
-        resolution: Grid resolution for splitting threshold.
-        min_length: Minimum segment length.
+        points: Nx2 array of polyline vertices.
+        tolerance: Maximum perpendicular distance to discard a point.
 
     Returns:
-        List of ((x1, y1), (x2, y2)) segments.
+        Simplified Mx2 array (M <= N).
     """
-    points = np.column_stack([wx, wy])
+    if len(points) <= 2:
+        return points
 
-    # If the cluster is small enough, fit a single line
-    if len(points) < 6:
-        return _fit_single_segment(points, min_length)
+    # Find the point farthest from the line between first and last
+    start, end = points[0], points[-1]
+    line_vec = end - start
+    line_len = np.linalg.norm(line_vec)
 
-    # PCA to find principal direction
-    centroid = points.mean(axis=0)
-    centered = points - centroid
-    cov = np.cov(centered.T)
-    eigvals, eigvecs = np.linalg.eigh(cov)
+    if line_len < 1e-12:
+        # Degenerate: start == end, keep the farthest point
+        dists = np.linalg.norm(points - start, axis=1)
+        idx = np.argmax(dists)
+        if dists[idx] > tolerance:
+            return np.array([start, points[idx], end])
+        return np.array([start, end])
 
-    # Principal direction = eigenvector with largest eigenvalue
-    principal = eigvecs[:, 1]  # eigh returns sorted ascending
+    line_unit = line_vec / line_len
+    # Perpendicular distances
+    vecs = points - start
+    proj = vecs @ line_unit
+    perp = vecs - np.outer(proj, line_unit)
+    dists = np.linalg.norm(perp, axis=1)
 
-    # Project onto principal axis
-    projections = centered @ principal
-    p_min, p_max = projections.min(), projections.max()
-    length = p_max - p_min
+    max_idx = np.argmax(dists)
+    max_dist = dists[max_idx]
 
-    if length < min_length:
-        return []
+    if max_dist <= tolerance:
+        return np.array([start, end])
 
-    # Check "thickness" along secondary axis — if thick, might be L-shaped
-    secondary = eigvecs[:, 0]
-    sec_proj = centered @ secondary
-    thickness = sec_proj.max() - sec_proj.min()
+    # Recurse on both halves
+    left = _rdp_simplify(points[:max_idx + 1], tolerance)
+    right = _rdp_simplify(points[max_idx:], tolerance)
 
-    # If width/length ratio is high, try splitting
-    if thickness > length * 0.4 and len(points) > 20:
-        return _split_and_fit(points, resolution, min_length)
-
-    # Single line segment: endpoints from projection extremes
-    p1 = centroid + principal * p_min
-    p2 = centroid + principal * p_max
-    return [((p1[0], p1[1]), (p2[0], p2[1]))]
-
-
-def _fit_single_segment(points, min_length):
-    """Fit a single line segment to a small set of points."""
-    if len(points) < 2:
-        return []
-
-    # Use the two most distant points
-    from scipy.spatial.distance import pdist, squareform
-    if len(points) <= 50:
-        dists = squareform(pdist(points))
-        i, j = np.unravel_index(dists.argmax(), dists.shape)
-    else:
-        i, j = 0, len(points) - 1
-
-    p1, p2 = points[i], points[j]
-    if np.linalg.norm(p2 - p1) < min_length:
-        return []
-    return [((p1[0], p1[1]), (p2[0], p2[1]))]
-
-
-def _split_and_fit(points, resolution, min_length, depth=0):
-    """Recursively split a wide cluster and fit segments to sub-clusters."""
-    if depth > 3 or len(points) < 6:
-        return _fit_single_segment(points, min_length)
-
-    # K-means with k=2 to split the cluster
-    from scipy.cluster.vq import kmeans2
-    try:
-        centroids, labels = kmeans2(points.astype(np.float64), 2, minit='points')
-    except Exception:
-        return _fit_single_segment(points, min_length)
-
-    segments = []
-    for k in range(2):
-        sub = points[labels == k]
-        if len(sub) >= 3:
-            segments.extend(
-                _fit_line_segments(sub[:, 0], sub[:, 1], resolution, min_length)
-            )
-    return segments
+    return np.vstack([left[:-1], right])
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +461,7 @@ def save_orthoimage(image, out_path):
 
 def run_pipeline(input_path, output_dir=None, output_dxf=None,
                  slice_height=None, thickness=0.3, resolution=0.02,
-                 min_density=5, save_image=True):
+                 min_density=3, save_image=True):
     """Run the full slice-to-plan pipeline.
 
     Args:
@@ -532,8 +564,8 @@ if __name__ == "__main__":
         help="Raster resolution in metres/pixel (default: 0.02 = 2cm)",
     )
     parser.add_argument(
-        "--min_density", type=int, default=5,
-        help="Minimum raster pixel density for wall detection (default: 5)",
+        "--min_density", type=int, default=3,
+        help="Minimum raster pixel density for wall detection (default: 3)",
     )
     parser.add_argument(
         "--no_image", action="store_true", default=False,
