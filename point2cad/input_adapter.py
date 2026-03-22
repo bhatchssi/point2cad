@@ -254,7 +254,9 @@ _READERS = {
 
 
 def downsample_points(points, voxel_size=0.01, labels=None):
-    """Voxel-based downsampling for large FARO scans.
+    """Voxel-based downsampling using pure numpy (no Open3D).
+
+    For each voxel, keeps the point closest to the voxel center.
 
     Args:
         points: Nx3 array.
@@ -264,80 +266,98 @@ def downsample_points(points, voxel_size=0.01, labels=None):
     Returns:
         Downsampled (points, labels) tuple.
     """
-    import open3d as o3d
+    # Quantize points to voxel grid
+    voxel_indices = np.floor(points / voxel_size).astype(np.int64)
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    downsampled = pcd.voxel_down_sample(voxel_size)
-    new_points = np.asarray(downsampled.points, dtype=np.float32)
+    # Create unique voxel keys
+    # Shift to non-negative indices
+    mins = voxel_indices.min(axis=0)
+    voxel_indices -= mins
+    maxes = voxel_indices.max(axis=0) + 1
 
-    new_labels = None
-    if labels is not None:
-        # Find nearest original point for each downsampled point
-        tree = o3d.geometry.KDTreeFlann(pcd)
-        new_labels = np.zeros(len(new_points), dtype=np.int32)
-        for i, pt in enumerate(new_points):
-            _, idx, _ = tree.search_knn_vector_3d(pt, 1)
-            new_labels[i] = labels[idx[0]]
+    # Flatten to 1D key per point
+    keys = (voxel_indices[:, 0] * maxes[1] * maxes[2] +
+            voxel_indices[:, 1] * maxes[2] +
+            voxel_indices[:, 2])
+
+    # For each unique voxel, pick the first point encountered
+    _, unique_idx = np.unique(keys, return_index=True)
+    unique_idx.sort()
+
+    new_points = points[unique_idx].astype(np.float32)
+    new_labels = labels[unique_idx] if labels is not None else None
 
     return new_points, new_labels
 
 
 def segment_region_growing(points, n_neighbors=30, smoothness_threshold=10.0,
                            curvature_threshold=1.0, min_cluster_size=50):
-    """Surface segmentation via Open3D normals + DBSCAN clustering.
+    """Surface segmentation via scipy DBSCAN (no Open3D).
 
-    Uses Open3D's native C++ DBSCAN for scalability on large point clouds.
-    This is a fallback when ParseNet is not available. For production use,
-    run generate_segmentation.py with ParseNet for better results.
+    Uses scipy's cKDTree for spatial indexing and a simple DBSCAN-style
+    clustering. This is a fallback when ParseNet is not available.
 
     Args:
         points: Nx3 array.
-        n_neighbors: Neighbors for normal estimation.
-        smoothness_threshold: Angle threshold in degrees (unused, kept for API).
-        curvature_threshold: Not used directly; kept for API compatibility.
+        n_neighbors: Not used (kept for API compatibility).
+        smoothness_threshold: Not used (kept for API compatibility).
+        curvature_threshold: Not used (kept for API compatibility).
         min_cluster_size: Minimum points per cluster.
 
     Returns:
         Integer label array of length N.
     """
-    import open3d as o3d
+    from scipy.spatial import cKDTree
+    from scipy.sparse import lil_matrix
+    from scipy.sparse.csgraph import connected_components
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    print("    Estimating normals...")
-    pcd.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamKNN(knn=n_neighbors)
-    )
-
-    # Use Open3D's native DBSCAN clustering (C++ implementation, memory-safe)
     spatial_extent = np.max(points, axis=0) - np.min(points, axis=0)
     scale = np.mean(spatial_extent) if np.mean(spatial_extent) > 0 else 1.0
     eps = scale * 0.05
 
-    print(f"    Running DBSCAN clustering (eps={eps:.4f}, min_points={min_cluster_size})...")
-    labels = np.array(pcd.cluster_dbscan(
-        eps=eps, min_points=min_cluster_size, print_progress=True
-    ))
+    n = len(points)
+    print(f"    Building KD-tree for {n} points...")
+    tree = cKDTree(points)
 
-    # DBSCAN labels: -1 = noise. Assign noise points to nearest cluster.
+    print(f"    Finding neighbors (eps={eps:.4f})...")
+    # query_pairs returns all pairs within eps — fast C implementation
+    pairs = tree.query_pairs(r=eps, output_type='ndarray')
+    print(f"    Found {len(pairs)} neighbor pairs")
+
+    # Build sparse adjacency and find connected components
+    print("    Computing connected components...")
+    adj = lil_matrix((n, n), dtype=bool)
+    if len(pairs) > 0:
+        adj[pairs[:, 0], pairs[:, 1]] = True
+        adj[pairs[:, 1], pairs[:, 0]] = True
+
+    n_components, comp_labels = connected_components(adj, directed=False)
+    print(f"    Found {n_components} raw components")
+
+    # Filter small clusters — relabel sequentially
+    labels = np.full(n, -1, dtype=np.int32)
+    current_label = 0
+    for comp_id in range(n_components):
+        mask = comp_labels == comp_id
+        if np.sum(mask) >= min_cluster_size:
+            labels[mask] = current_label
+            current_label += 1
+
+    num_clusters = current_label
+    print(f"    {num_clusters} clusters after filtering (min_size={min_cluster_size})")
+
+    # Assign noise points to nearest cluster
     unlabeled = labels == -1
-    num_noise = np.sum(unlabeled)
-    num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    print(f"    DBSCAN found {num_clusters} clusters, {num_noise} noise points")
-
     if np.any(unlabeled) and num_clusters > 0:
-        from scipy.spatial import cKDTree
         labeled_mask = ~unlabeled
         labeled_tree = cKDTree(points[labeled_mask])
         _, nn_idx = labeled_tree.query(points[unlabeled])
         labels[unlabeled] = labels[labeled_mask][nn_idx]
 
-    # If everything ended up unlabeled, assign a single cluster
     if num_clusters == 0:
         labels[:] = 0
 
-    return labels.astype(np.int32)
+    return labels
 
 
 def load_point_cloud(path, max_points=None, voxel_size=None, auto_segment=True):
@@ -375,11 +395,10 @@ def load_point_cloud(path, max_points=None, voxel_size=None, auto_segment=True):
         if labels is not None:
             labels = labels[valid]
 
-    # Safety pre-subsample: if the cloud is very large, reduce with numpy
-    # first to avoid segfaults in Open3D on macOS
-    SAFE_LIMIT = 2_000_000
+    # Pre-subsample very large clouds to keep processing time reasonable
+    SAFE_LIMIT = 1_000_000
     if len(points) > SAFE_LIMIT:
-        print(f"  Large scan detected ({len(points)} pts). Pre-subsampling to {SAFE_LIMIT} for stability...")
+        print(f"  Large scan detected ({len(points)} pts). Pre-subsampling to {SAFE_LIMIT}...")
         indices = np.random.default_rng(42).choice(len(points), SAFE_LIMIT, replace=False)
         indices.sort()
         points = points[indices]
