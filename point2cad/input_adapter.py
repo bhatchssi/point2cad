@@ -290,16 +290,17 @@ def downsample_points(points, voxel_size=0.01, labels=None):
     return new_points, new_labels
 
 
-def segment_region_growing(points, n_neighbors=30, smoothness_threshold=10.0,
+def segment_region_growing(points, n_neighbors=15, smoothness_threshold=10.0,
                            curvature_threshold=1.0, min_cluster_size=50):
-    """Surface segmentation via scipy DBSCAN (no Open3D).
+    """Surface segmentation via KNN graph + connected components.
 
-    Uses scipy's cKDTree for spatial indexing and a simple DBSCAN-style
-    clustering. This is a fallback when ParseNet is not available.
+    Memory-efficient approach: builds a sparse KNN graph (fixed number of
+    edges per point) rather than a radius search which can explode on
+    dense scans.
 
     Args:
         points: Nx3 array.
-        n_neighbors: Not used (kept for API compatibility).
+        n_neighbors: Number of nearest neighbors per point for graph edges.
         smoothness_threshold: Not used (kept for API compatibility).
         curvature_threshold: Not used (kept for API compatibility).
         min_cluster_size: Minimum points per cluster.
@@ -308,29 +309,35 @@ def segment_region_growing(points, n_neighbors=30, smoothness_threshold=10.0,
         Integer label array of length N.
     """
     from scipy.spatial import cKDTree
-    from scipy.sparse import lil_matrix
+    from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import connected_components
 
-    spatial_extent = np.max(points, axis=0) - np.min(points, axis=0)
-    scale = np.mean(spatial_extent) if np.mean(spatial_extent) > 0 else 1.0
-    eps = scale * 0.05
-
     n = len(points)
+    k = min(n_neighbors, n - 1)
+
     print(f"    Building KD-tree for {n} points...")
     tree = cKDTree(points)
 
-    print(f"    Finding neighbors (eps={eps:.4f})...")
-    # query_pairs returns all pairs within eps — fast C implementation
-    pairs = tree.query_pairs(r=eps, output_type='ndarray')
-    print(f"    Found {len(pairs)} neighbor pairs")
+    print(f"    Querying {k} nearest neighbors per point...")
+    distances, indices = tree.query(points, k=k + 1)  # +1 because first is self
+    # Remove self-neighbor (column 0)
+    distances = distances[:, 1:]
+    indices = indices[:, 1:]
 
-    # Build sparse adjacency and find connected components
+    # Compute adaptive distance threshold: connect neighbors within
+    # 3x the median neighbor distance (adapts to local point density)
+    median_dist = np.median(distances[:, 0])
+    dist_threshold = median_dist * 3.0
+    print(f"    Median NN distance: {median_dist:.4f}, threshold: {dist_threshold:.4f}")
+
+    # Build sparse adjacency from KNN with distance filter (vectorized)
+    mask = distances <= dist_threshold
+    row_idx = np.repeat(np.arange(n), k).reshape(n, k)[mask]
+    col_idx = indices[mask]
+    data = np.ones(len(row_idx), dtype=bool)
+    adj = csr_matrix((data, (row_idx, col_idx)), shape=(n, n))
+
     print("    Computing connected components...")
-    adj = lil_matrix((n, n), dtype=bool)
-    if len(pairs) > 0:
-        adj[pairs[:, 0], pairs[:, 1]] = True
-        adj[pairs[:, 1], pairs[:, 0]] = True
-
     n_components, comp_labels = connected_components(adj, directed=False)
     print(f"    Found {n_components} raw components")
 
