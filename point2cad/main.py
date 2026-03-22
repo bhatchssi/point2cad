@@ -9,6 +9,7 @@ from tqdm import tqdm
 from point2cad.fitting_one_surface import process_one_surface
 from point2cad.io_utils import save_unclipped_meshes, save_clipped_meshes, save_topology
 from point2cad.utils import seed_everything, continuous_labels, normalize_points, make_colormap_optimal
+from point2cad.input_adapter import load_point_cloud, detect_format
 from point2cad.projection_2d import generate_2d_views, STANDARD_VIEWS
 
 
@@ -53,6 +54,18 @@ if __name__ == "__main__":
     parser.add_argument("--num_inr_fit_attempts", type=int, default=1)
     parser.add_argument("--surfaces_multiprocessing", type=int, default=1)
     parser.add_argument(
+        "--max_points", type=int, default=None,
+        help="Maximum points to load from input (random subsampling for large FARO scans).",
+    )
+    parser.add_argument(
+        "--voxel_size", type=float, default=None,
+        help="Voxel downsampling size for dense point clouds.",
+    )
+    parser.add_argument(
+        "--no_auto_segment", action="store_true", default=False,
+        help="Disable automatic segmentation for non-XYZC inputs.",
+    )
+    parser.add_argument(
         "--output_2d", action="store_true", default=False,
         help="Generate 2D DXF drawings from the reconstructed 3D model",
     )
@@ -89,12 +102,23 @@ if __name__ == "__main__":
     os.makedirs("{}/topo".format(cfg.path_out), exist_ok=True)
 
     # ============================ load points ============================
-    points_labels = np.loadtxt(cfg.path_in).astype(np.float32)
-    assert (
-        points_labels.shape[1] == 4
-    ), "This pipeline expects annotated point clouds (4 values per point). Refer to README for further instructions"
-    points = points_labels[:, :3]
-    labels = points_labels[:, 3].astype(np.int32)
+    fmt = detect_format(cfg.path_in)
+    if fmt == "xyzc":
+        # Legacy path: direct XYZC loading (original behavior)
+        points_labels = np.loadtxt(cfg.path_in).astype(np.float32)
+        assert (
+            points_labels.shape[1] == 4
+        ), "This pipeline expects annotated point clouds (4 values per point). Refer to README for further instructions"
+        points = points_labels[:, :3]
+        labels = points_labels[:, 3].astype(np.int32)
+    else:
+        # New path: FARO and other scanner formats via input adapter
+        points, labels = load_point_cloud(
+            cfg.path_in,
+            max_points=cfg.max_points,
+            voxel_size=cfg.voxel_size,
+            auto_segment=not cfg.no_auto_segment,
+        )
     labels = continuous_labels(labels)
 
     points = normalize_points(points)

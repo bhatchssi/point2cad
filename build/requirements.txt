@@ -1,7 +1,10 @@
 ezdxf
 geomdl
+laspy
+lazrs
 numpy
 open3d
+pye57
 pyvista
 rtree
 scipy
