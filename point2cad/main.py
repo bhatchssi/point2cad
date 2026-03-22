@@ -85,6 +85,10 @@ if __name__ == "__main__":
         "--dxf_scale", type=float, default=100.0,
         help="Scale factor for DXF output (default: 100, maps normalized coords to mm).",
     )
+    parser.add_argument(
+        "--no_dimensions", action="store_true", default=False,
+        help="Disable automatic measurement dimensions in DXF output.",
+    )
     cfg = parser.parse_args()
 
     seed_everything(cfg.seed)
@@ -163,11 +167,14 @@ if __name__ == "__main__":
 
         from point2cad.export_dxf import export_all_views, export_single_view
 
+        add_dims = not cfg.no_dimensions
+
         # Export combined multi-view drawing
         export_all_views(
             views_2d,
             "{}/2d/all_views.dxf".format(cfg.path_out),
             scale=cfg.dxf_scale,
+            add_dimensions=add_dims,
         )
 
         # Export individual view files
@@ -177,6 +184,7 @@ if __name__ == "__main__":
                 view_name,
                 "{}/2d/{}.dxf".format(cfg.path_out, view_name),
                 scale=cfg.dxf_scale,
+                add_dimensions=add_dims,
             )
 
     print("Done")
