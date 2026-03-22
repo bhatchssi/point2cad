@@ -9,6 +9,7 @@ from tqdm import tqdm
 from point2cad.fitting_one_surface import process_one_surface
 from point2cad.io_utils import save_unclipped_meshes, save_clipped_meshes, save_topology
 from point2cad.utils import seed_everything, continuous_labels, normalize_points, make_colormap_optimal
+from point2cad.projection_2d import generate_2d_views, STANDARD_VIEWS
 
 
 def process_multiprocessing(cfg, uniq_labels, points, labels, device):
@@ -51,6 +52,26 @@ if __name__ == "__main__":
     parser.add_argument("--max_parallel_surfaces", type=int, default=4)
     parser.add_argument("--num_inr_fit_attempts", type=int, default=1)
     parser.add_argument("--surfaces_multiprocessing", type=int, default=1)
+    parser.add_argument(
+        "--output_2d", action="store_true", default=False,
+        help="Generate 2D DXF drawings from the reconstructed 3D model",
+    )
+    parser.add_argument(
+        "--views_2d", type=str, nargs="*", default=None,
+        help="Which 2D views to generate (top, front, right). Default: all.",
+    )
+    parser.add_argument(
+        "--slice_axis", type=str, default=None, choices=["x", "y", "z"],
+        help="Axis along which to generate cross-section slices.",
+    )
+    parser.add_argument(
+        "--num_slices", type=int, default=5,
+        help="Number of cross-section slices (default: 5).",
+    )
+    parser.add_argument(
+        "--dxf_scale", type=float, default=100.0,
+        help="Scale factor for DXF output (default: 100, maps normalized coords to mm).",
+    )
     cfg = parser.parse_args()
 
     seed_everything(cfg.seed)
@@ -100,6 +121,38 @@ if __name__ == "__main__":
 
     # ============================ get edges and corners ============================
     print("Saving topology (edges and corners)...")
-    save_topology(clipped_meshes, "{}/topo/topo.json".format(cfg.path_out))
+    topo_path = "{}/topo/topo.json".format(cfg.path_out)
+    save_topology(clipped_meshes, topo_path)
+
+    # ============================ generate 2D DXF output ==========================
+    if cfg.output_2d:
+        print("Generating 2D views...")
+        os.makedirs("{}/2d".format(cfg.path_out), exist_ok=True)
+
+        views_2d = generate_2d_views(
+            clipped_meshes,
+            topo_path,
+            views=cfg.views_2d,
+            slice_axis=cfg.slice_axis,
+            num_slices=cfg.num_slices,
+        )
+
+        from point2cad.export_dxf import export_all_views, export_single_view
+
+        # Export combined multi-view drawing
+        export_all_views(
+            views_2d,
+            "{}/2d/all_views.dxf".format(cfg.path_out),
+            scale=cfg.dxf_scale,
+        )
+
+        # Export individual view files
+        for view_name in views_2d.get("projections", {}):
+            export_single_view(
+                views_2d,
+                view_name,
+                "{}/2d/{}.dxf".format(cfg.path_out, view_name),
+                scale=cfg.dxf_scale,
+            )
 
     print("Done")
