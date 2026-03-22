@@ -285,15 +285,16 @@ def downsample_points(points, voxel_size=0.01, labels=None):
 
 def segment_region_growing(points, n_neighbors=30, smoothness_threshold=10.0,
                            curvature_threshold=1.0, min_cluster_size=50):
-    """Basic region-growing segmentation via Open3D normals + spatial clustering.
+    """Surface segmentation via Open3D normals + DBSCAN clustering.
 
+    Uses Open3D's native C++ DBSCAN for scalability on large point clouds.
     This is a fallback when ParseNet is not available. For production use,
     run generate_segmentation.py with ParseNet for better results.
 
     Args:
         points: Nx3 array.
         n_neighbors: Neighbors for normal estimation.
-        smoothness_threshold: Angle threshold in degrees for region growing.
+        smoothness_threshold: Angle threshold in degrees (unused, kept for API).
         curvature_threshold: Not used directly; kept for API compatibility.
         min_cluster_size: Minimum points per cluster.
 
@@ -304,70 +305,39 @@ def segment_region_growing(points, n_neighbors=30, smoothness_threshold=10.0,
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
+    print("    Estimating normals...")
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamKNN(knn=n_neighbors)
     )
 
-    # Use DBSCAN clustering on combined position+normal features as a
-    # lightweight proxy for region-growing segmentation
-    normals = np.asarray(pcd.normals, dtype=np.float32)
-
-    # Weight normals relative to spatial extent so both contribute
+    # Use Open3D's native DBSCAN clustering (C++ implementation, memory-safe)
     spatial_extent = np.max(points, axis=0) - np.min(points, axis=0)
     scale = np.mean(spatial_extent) if np.mean(spatial_extent) > 0 else 1.0
-    normal_weight = scale * 0.3
-
-    features = np.hstack([points, normals * normal_weight])
-
-    from scipy.spatial import cKDTree
-    tree = cKDTree(features)
     eps = scale * 0.05
 
-    # Simple connected-component labeling via neighbor queries
-    n = len(points)
-    labels = np.full(n, -1, dtype=np.int32)
-    current_label = 0
-    visited = np.zeros(n, dtype=bool)
+    print(f"    Running DBSCAN clustering (eps={eps:.4f}, min_points={min_cluster_size})...")
+    labels = np.array(pcd.cluster_dbscan(
+        eps=eps, min_points=min_cluster_size, print_progress=True
+    ))
 
-    for seed in range(n):
-        if visited[seed]:
-            continue
-
-        # BFS from seed
-        queue = [seed]
-        cluster = []
-        while queue:
-            idx = queue.pop(0)
-            if visited[idx]:
-                continue
-            visited[idx] = True
-            cluster.append(idx)
-
-            neighbors = tree.query_ball_point(features[idx], eps)
-            for nb in neighbors:
-                if not visited[nb]:
-                    # Check normal similarity
-                    cos_angle = np.dot(normals[idx], normals[nb])
-                    if cos_angle > np.cos(np.radians(smoothness_threshold)):
-                        queue.append(nb)
-
-        if len(cluster) >= min_cluster_size:
-            labels[np.array(cluster)] = current_label
-            current_label += 1
-
-    # Assign unlabeled points to nearest cluster
+    # DBSCAN labels: -1 = noise. Assign noise points to nearest cluster.
     unlabeled = labels == -1
-    if np.any(unlabeled) and current_label > 0:
+    num_noise = np.sum(unlabeled)
+    num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    print(f"    DBSCAN found {num_clusters} clusters, {num_noise} noise points")
+
+    if np.any(unlabeled) and num_clusters > 0:
+        from scipy.spatial import cKDTree
         labeled_mask = ~unlabeled
         labeled_tree = cKDTree(points[labeled_mask])
         _, nn_idx = labeled_tree.query(points[unlabeled])
         labels[unlabeled] = labels[labeled_mask][nn_idx]
 
     # If everything ended up unlabeled, assign a single cluster
-    if current_label == 0:
+    if num_clusters == 0:
         labels[:] = 0
 
-    return labels
+    return labels.astype(np.int32)
 
 
 def load_point_cloud(path, max_points=None, voxel_size=None, auto_segment=True):
@@ -405,7 +375,18 @@ def load_point_cloud(path, max_points=None, voxel_size=None, auto_segment=True):
         if labels is not None:
             labels = labels[valid]
 
-    # Voxel downsampling for large FARO scans
+    # Safety pre-subsample: if the cloud is very large, reduce with numpy
+    # first to avoid segfaults in Open3D on macOS
+    SAFE_LIMIT = 2_000_000
+    if len(points) > SAFE_LIMIT:
+        print(f"  Large scan detected ({len(points)} pts). Pre-subsampling to {SAFE_LIMIT} for stability...")
+        indices = np.random.default_rng(42).choice(len(points), SAFE_LIMIT, replace=False)
+        indices.sort()
+        points = points[indices]
+        if labels is not None:
+            labels = labels[indices]
+
+    # Voxel downsampling for large scans
     if voxel_size is not None and voxel_size > 0:
         before = len(points)
         points, labels = downsample_points(points, voxel_size, labels)
