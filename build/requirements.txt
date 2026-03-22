@@ -2,6 +2,7 @@ ezdxf
 geomdl
 laspy
 lazrs
+manifold3d
 numpy
 open3d
 pye57

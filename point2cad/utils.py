@@ -165,18 +165,23 @@ def suppress_output_fd():
 
 
 def get_rng(device, seed=None, seed_increment=0):
+    if isinstance(device, str):
+        device = torch.device(device)
+    elif isinstance(device, int):
+        device = torch.device("cuda", device)
+
     if seed is None:
-        if device == "cpu":
+        if device.type == "cpu":
             rng = torch.random.default_generator
-        else:
-            if isinstance(device, str):
-                device = torch.device(device)
-            elif isinstance(device, int):
-                device = torch.device("cuda", device)
+        elif device.type == "cuda":
             device_idx = device.index
             if device_idx is None:
                 device_idx = torch.cuda.current_device()
             rng = torch.cuda.default_generators[device_idx]
+        else:
+            # MPS and other backends: create a generator with a random seed
+            rng = torch.Generator(device)
+            rng.manual_seed(torch.seed())
     else:
         rng = torch.Generator(device)
         rng.manual_seed(seed + seed_increment)

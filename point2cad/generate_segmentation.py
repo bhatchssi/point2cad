@@ -40,12 +40,16 @@ def normalize_points(points):
 
 
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from point2cad.device import select_device, wrap_model_for_device, load_checkpoint
 
     parser = argparse.ArgumentParser(description="ParseNet Segmentation Prediction")
     parser.add_argument("--path_in", type=str, default="./assets/abc_00470.xyz")
     parser.add_argument("--with_normals", type=bool, default=False)
+    parser.add_argument("--device", type=str, default=None, choices=["cuda", "mps", "cpu"])
     cfg = parser.parse_args()
+
+    device = select_device(cfg.device)
+    print(f"Using device: {device}")
 
     num_channels = 6 if cfg.with_normals else 3
     pth_path = "./logs/pretrained_models/parsenet.pth" if cfg.with_normals else "./logs/pretrained_models/parsenet_no_normals.pth"
@@ -60,12 +64,12 @@ if __name__ == "__main__":
         mode=0,
         num_channels=num_channels,
     )
-    model = torch.nn.DataParallel(model, device_ids=[0])
+    model = wrap_model_for_device(model, device)
 
     model.to(device)
     model.eval()
     model.load_state_dict(
-        torch.load(pth_path)
+        load_checkpoint(pth_path, device)
     )
 
     iterations = 50

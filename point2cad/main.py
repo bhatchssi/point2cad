@@ -6,6 +6,7 @@ import torch
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
+from point2cad.device import select_device, empty_cache
 from point2cad.fitting_one_surface import process_one_surface
 from point2cad.io_utils import save_unclipped_meshes, save_clipped_meshes, save_topology
 from point2cad.utils import seed_everything, continuous_labels, normalize_points, make_colormap_optimal
@@ -40,8 +41,6 @@ def process_singleprocessing(cfg, uniq_labels, points, labels, device):
 
 
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     color_list = make_colormap_optimal()
 
     parser = argparse.ArgumentParser(description="Point2CAD pipeline")
@@ -89,7 +88,14 @@ if __name__ == "__main__":
         "--no_dimensions", action="store_true", default=False,
         help="Disable automatic measurement dimensions in DXF output.",
     )
+    parser.add_argument(
+        "--device", type=str, default=None, choices=["cuda", "mps", "cpu"],
+        help="Compute device (default: auto-detect best available).",
+    )
     cfg = parser.parse_args()
+
+    device = select_device(cfg.device)
+    print(f"Using device: {device}")
 
     seed_everything(cfg.seed)
 
@@ -126,8 +132,7 @@ if __name__ == "__main__":
     labels = continuous_labels(labels)
 
     points = normalize_points(points)
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    empty_cache(device)
 
     uniq_labels = np.unique(labels)
 

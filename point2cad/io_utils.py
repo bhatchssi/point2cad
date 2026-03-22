@@ -1,12 +1,19 @@
 import itertools
 import json
 import numpy as np
-import pymesh
 import pyvista as pv
 import scipy
 import trimesh
 from collections import Counter
 
+from point2cad.mesh_ops import (
+    form_mesh,
+    merge_meshes,
+    detect_self_intersection,
+    resolve_self_intersection,
+    separate_mesh,
+    remove_duplicated_vertices,
+)
 from point2cad.utils import suppress_output_fd
 
 
@@ -21,7 +28,7 @@ def save_unclipped_meshes(meshes, color_list, out_path):
         tri_meshes_s.visual.face_colors = color_list[s]
         non_clipped_meshes.append(tri_meshes_s)
         pm_meshes.append(
-            pymesh.form_mesh(
+            form_mesh(
                 meshes[s]["mesh"].points,
                 meshes[s]["mesh"].faces.reshape(-1, 4)[:, 1:],
             )
@@ -34,16 +41,16 @@ def save_unclipped_meshes(meshes, color_list, out_path):
 
 
 def save_clipped_meshes(pm_meshes, out_meshes, color_list, out_path):
-    pm_merged = pymesh.merge_meshes(pm_meshes)
+    pm_merged = merge_meshes(pm_meshes)
 
     face_sources_merged = pm_merged.get_attribute("face_sources").astype(np.int32)
 
-    detect_pairs = pymesh.detect_self_intersection(pm_merged)
-    pm_resolved_ori = pymesh.resolve_self_intersection(pm_merged)
+    detect_pairs = detect_self_intersection(pm_merged)
+    pm_resolved_ori = resolve_self_intersection(pm_merged)
 
-    a = pymesh.separate_mesh(pm_resolved_ori)
+    a = separate_mesh(pm_resolved_ori)
 
-    pm_resolved, info_dict = pymesh.remove_duplicated_vertices(
+    pm_resolved, info_dict = remove_duplicated_vertices(
         pm_resolved_ori, tol=1e-6, importance=None
     )
 

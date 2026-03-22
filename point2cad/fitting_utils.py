@@ -91,7 +91,10 @@ def up_sample_points_torch_memory_efficient(points, times=1):
     return points
 
 
-def create_grid(input, grid_points, size_u, size_v, thres=0.02, device="cuda"):
+def create_grid(input, grid_points, size_u, size_v, thres=0.02, device=None):
+    if device is None:
+        from point2cad.device import select_device
+        device = select_device()
     grid_points = torch.from_numpy(grid_points.astype(np.float32)).to(device)
     input = torch.from_numpy(input.astype(np.float32)).to(device)
     try:
@@ -282,7 +285,7 @@ def project_to_plane(points, a, d):
 
 
 def bit_mapping_points_torch(
-    input, output_points, thres, size_u, size_v, mesh=None, device="cuda"
+    input, output_points, thres, size_u, size_v, mesh=None, device=None
 ):
     mask, diff, filter, grid_mean_points = create_grid(
         input, output_points, size_u, size_v, thres=thres, device=device
@@ -291,7 +294,7 @@ def bit_mapping_points_torch(
     return mesh
 
 
-def visualize_basic_mesh(shape_type, in_points, pred, epsilon=0.1, device="cuda"):
+def visualize_basic_mesh(shape_type, in_points, pred, epsilon=0.1, device=None):
     if shape_type == "plane":
         # Fit plane
         part_points = (

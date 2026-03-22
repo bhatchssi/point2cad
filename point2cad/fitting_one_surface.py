@@ -430,9 +430,8 @@ def fit_one_inr_spline(
         "fp64": torch.float64,
     }[dtype]
 
-    if device != "cpu" and not torch.cuda.is_available():
-        warnings.warn("CUDA not available, fitting on CPU may be slow")
-        device = "cpu"
+    from point2cad.device import select_device
+    device = select_device(device)
 
     model = SplineINR(
         is_u_closed=is_u_closed,
@@ -453,7 +452,7 @@ def fit_one_inr_spline(
     )
 
     if model_init_checkpoint_path is not None:
-        model.load_state_dict(torch.load(model_init_checkpoint_path))
+        model.load_state_dict(torch.load(model_init_checkpoint_path, map_location=device))
 
     optimizer = {
         "sgd": torch.optim.SGD,
