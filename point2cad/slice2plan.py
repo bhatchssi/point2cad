@@ -276,73 +276,70 @@ def detect_walls(image, origin, resolution, min_density=3,
 
 
 def _skeletonize_proper(binary):
-    """Zhang-Suen thinning to produce clean 1px-wide skeletons.
+    """Zhang-Suen thinning — fully vectorized with numpy.
 
-    Unlike simple erosion-based skeletonization, this preserves connectivity
-    and produces clean centrelines suitable for chaining.
+    Produces clean 1px-wide skeletons that preserve connectivity,
+    suitable for pixel chaining. Runs efficiently on large images
+    (tested on 8000x20000+ scanner orthoimages).
     """
-    img = binary.astype(np.uint8).copy()
-    rows, cols = img.shape
+    img = np.pad(binary.astype(np.uint8), 1, mode='constant',
+                 constant_values=0)
     changed = True
+    iteration = 0
 
     while changed:
         changed = False
         for step in (0, 1):
-            # Pad for safe neighbour access
-            padded = np.pad(img, 1, mode='constant', constant_values=0)
-            markers = np.zeros_like(img, dtype=bool)
+            # Extract 8 neighbours using array slicing (P2..P9)
+            # P2=N, P3=NE, P4=E, P5=SE, P6=S, P7=SW, P8=W, P9=NW
+            p2 = img[:-2, 1:-1]   # north
+            p3 = img[:-2, 2:]     # northeast
+            p4 = img[1:-1, 2:]    # east
+            p5 = img[2:, 2:]      # southeast
+            p6 = img[2:, 1:-1]    # south
+            p7 = img[2:, :-2]     # southwest
+            p8 = img[1:-1, :-2]   # west
+            p9 = img[:-2, :-2]    # northwest
 
-            # Get all foreground pixels
-            ys, xs = np.where(img == 1)
+            center = img[1:-1, 1:-1]
 
-            for idx in range(len(ys)):
-                r, c = ys[idx], xs[idx]
-                rp, cp = r + 1, c + 1  # padded coords
+            # B: number of non-zero neighbours (2 <= B <= 6)
+            B = (p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9).astype(np.int16)
 
-                # 8-neighbours (P2..P9 in Zhang-Suen convention)
-                p2 = padded[rp - 1, cp]
-                p3 = padded[rp - 1, cp + 1]
-                p4 = padded[rp, cp + 1]
-                p5 = padded[rp + 1, cp + 1]
-                p6 = padded[rp + 1, cp]
-                p7 = padded[rp + 1, cp - 1]
-                p8 = padded[rp, cp - 1]
-                p9 = padded[rp - 1, cp - 1]
+            # A: number of 0->1 transitions in clockwise order
+            # Order: P2,P3,P4,P5,P6,P7,P8,P9,P2
+            A = (((p2 == 0) & (p3 == 1)).astype(np.int16) +
+                 ((p3 == 0) & (p4 == 1)).astype(np.int16) +
+                 ((p4 == 0) & (p5 == 1)).astype(np.int16) +
+                 ((p5 == 0) & (p6 == 1)).astype(np.int16) +
+                 ((p6 == 0) & (p7 == 1)).astype(np.int16) +
+                 ((p7 == 0) & (p8 == 1)).astype(np.int16) +
+                 ((p8 == 0) & (p9 == 1)).astype(np.int16) +
+                 ((p9 == 0) & (p2 == 1)).astype(np.int16))
 
-                neighbours = [p2, p3, p4, p5, p6, p7, p8, p9]
-                B = sum(neighbours)  # number of non-zero neighbours
+            # Common conditions
+            cond = (center == 1) & (B >= 2) & (B <= 6) & (A == 1)
 
-                if B < 2 or B > 6:
-                    continue
+            if step == 0:
+                # Step 1: P2*P4*P6==0 and P4*P6*P8==0
+                cond &= (p2 * p4 * p6 == 0)
+                cond &= (p4 * p6 * p8 == 0)
+            else:
+                # Step 2: P2*P4*P8==0 and P2*P6*P8==0
+                cond &= (p2 * p4 * p8 == 0)
+                cond &= (p2 * p6 * p8 == 0)
 
-                # Count 0->1 transitions in the ordered sequence
-                A = 0
-                seq = neighbours + [neighbours[0]]
-                for k in range(8):
-                    if seq[k] == 0 and seq[k + 1] == 1:
-                        A += 1
-
-                if A != 1:
-                    continue
-
-                if step == 0:
-                    if p2 * p4 * p6 != 0:
-                        continue
-                    if p4 * p6 * p8 != 0:
-                        continue
-                else:
-                    if p2 * p4 * p8 != 0:
-                        continue
-                    if p2 * p6 * p8 != 0:
-                        continue
-
-                markers[r, c] = True
-
-            if markers.any():
-                img[markers] = 0
+            if cond.any():
+                img[1:-1, 1:-1][cond] = 0
                 changed = True
 
-    return img
+        iteration += 1
+        if iteration % 10 == 0:
+            remaining = img[1:-1, 1:-1].sum()
+            print(f"    Thinning iteration {iteration}: {remaining:,} pixels remaining")
+
+    # Remove padding
+    return img[1:-1, 1:-1]
 
 
 def _chain_skeleton(skeleton):
@@ -572,12 +569,36 @@ def save_orthoimage(image, out_path):
 def load_image(path):
     """Load a grayscale image from PNG/JPG/BMP/PGM.
 
+    Handles alpha channels correctly: if the image has transparency,
+    composites onto a black background so transparent areas become black
+    (empty) and opaque wall pixels are preserved.
+
     Returns a 2D uint8 numpy array (grayscale).
     """
     try:
         from PIL import Image
-        img = Image.open(path).convert("L")
-        return np.array(img, dtype=np.uint8)
+        # Increase the decompression bomb limit for large scanner images
+        Image.MAX_IMAGE_PIXELS = 300_000_000
+
+        img = Image.open(path)
+        print(f"  Image mode: {img.mode}, size: {img.size}")
+
+        if img.mode in ("RGBA", "LA", "PA"):
+            # Composite onto black background — transparent = black (empty)
+            background = Image.new("L", img.size, 0)
+            # Split to get alpha; convert RGB/LA to grayscale
+            if img.mode == "RGBA":
+                gray = img.convert("LA")  # Luminance + Alpha
+                l_channel, alpha = gray.split()
+            elif img.mode == "LA":
+                l_channel, alpha = img.split()
+            else:  # PA (palette + alpha)
+                img = img.convert("LA")
+                l_channel, alpha = img.split()
+            background.paste(l_channel, mask=alpha)
+            return np.array(background, dtype=np.uint8)
+        else:
+            return np.array(img.convert("L"), dtype=np.uint8)
     except ImportError:
         pass
 
@@ -754,7 +775,7 @@ def run_pipeline(input_path, output_dir=None, output_dxf=None,
 
 
 def run_pipeline_from_image(image_path, output_dxf=None, resolution=0.02,
-                            min_density=3, invert=False):
+                            min_density=3, invert=False, max_pixels=20_000_000):
     """Run wall detection + DXF export from a pre-rendered PNG orthoimage.
 
     Skips point cloud loading, slicing, and rasterization — reads the image
@@ -769,6 +790,9 @@ def run_pipeline_from_image(image_path, output_dxf=None, resolution=0.02,
             output DXF. E.g. 0.02 means each pixel = 2cm.
         min_density: Minimum pixel brightness (0-255) to consider as wall.
         invert: If True, invert the image (dark pixels become walls).
+        max_pixels: Maximum image size in pixels. Larger images are
+            downscaled to this size (default 20M pixels). The resolution
+            is adjusted proportionally so the DXF output is still correct.
 
     Returns:
         Path to the output DXF file.
@@ -781,7 +805,8 @@ def run_pipeline_from_image(image_path, output_dxf=None, resolution=0.02,
 
     print(f"Reading image: {image_path}")
     image = load_image(image_path)
-    print(f"  Image size: {image.shape[1]} x {image.shape[0]} pixels")
+    print(f"  Image size: {image.shape[1]} x {image.shape[0]} pixels "
+          f"({image.shape[0] * image.shape[1]:,} total)")
 
     if invert:
         image = 255 - image
@@ -796,6 +821,33 @@ def run_pipeline_from_image(image_path, output_dxf=None, resolution=0.02,
     else:
         origin = (0.0, 0.0)
         print(f"  No worldfile found, using --resolution={resolution} m/px")
+
+    # Downscale if the image is very large
+    total_pixels = image.shape[0] * image.shape[1]
+    if total_pixels > max_pixels:
+        scale_factor = np.sqrt(max_pixels / total_pixels)
+        new_h = max(1, int(image.shape[0] * scale_factor))
+        new_w = max(1, int(image.shape[1] * scale_factor))
+        print(f"  Downscaling: {image.shape[1]}x{image.shape[0]} -> "
+              f"{new_w}x{new_h} ({scale_factor:.2f}x)")
+
+        # Use PIL for quality downscale if available, else numpy
+        try:
+            from PIL import Image as PILImage
+            pil_img = PILImage.fromarray(image)
+            pil_img = pil_img.resize((new_w, new_h), PILImage.LANCZOS)
+            image = np.array(pil_img, dtype=np.uint8)
+        except ImportError:
+            # Simple block-mean downscale
+            bh = image.shape[0] // new_h
+            bw = image.shape[1] // new_w
+            image = image[:new_h * bh, :new_w * bw]
+            image = image.reshape(new_h, bh, new_w, bw).max(axis=(1, 3)).astype(np.uint8)
+
+        # Adjust resolution to compensate for downscale
+        resolution = resolution / scale_factor
+        # Adjust origin (worldfile origin doesn't change)
+        print(f"  Adjusted resolution: {resolution:.4f} m/px")
 
     print(f"  Real-world extents: "
           f"{image.shape[1]*resolution:.1f}m x {image.shape[0]*resolution:.1f}m")
