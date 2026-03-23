@@ -157,6 +157,53 @@ def rasterize(points_2d, resolution=0.02):
 #   6. Simplify each polyline (RDP) into clean wall segments
 # ---------------------------------------------------------------------------
 
+def _otsu_threshold(image):
+    """Compute Otsu's optimal threshold for a grayscale image.
+
+    Finds the threshold that minimizes intra-class variance between
+    foreground (walls) and background (everything else). Only considers
+    non-zero pixels so the vast black background doesn't skew the result.
+
+    Returns:
+        Optimal threshold value (int, 0-255).
+    """
+    # Only consider non-zero pixels
+    nonzero = image[image > 0].ravel()
+    if len(nonzero) == 0:
+        return 128
+
+    # Build histogram of non-zero values
+    hist = np.zeros(256, dtype=np.float64)
+    for v in nonzero:
+        hist[v] += 1
+    hist /= hist.sum()
+
+    # Otsu's method: maximize between-class variance
+    best_t = 0
+    best_var = 0.0
+    w0 = 0.0  # weight of background class
+    mu0 = 0.0  # mean of background class
+    mu_total = np.sum(np.arange(256) * hist)
+
+    for t in range(1, 256):
+        w0 += hist[t - 1]
+        if w0 == 0:
+            continue
+        w1 = 1.0 - w0
+        if w1 == 0:
+            break
+        mu0 += (t - 1) * hist[t - 1]
+        mu1 = (mu_total - mu0) / w1
+        mu0_norm = mu0 / w0
+
+        var_between = w0 * w1 * (mu0_norm - mu1) ** 2
+        if var_between > best_var:
+            best_var = var_between
+            best_t = t
+
+    return best_t
+
+
 def detect_walls(image, origin, resolution, min_density=3,
                  min_line_length=0.3, simplify_tolerance=None,
                  morph_iterations=None):
@@ -201,9 +248,15 @@ def detect_walls(image, origin, resolution, min_density=3,
         stretched = image.copy()
 
     # --- 2. Threshold ---
-    # After stretching, walls should be bright. Use a moderate threshold
-    # to separate walls from the diffuse scanner glow.
-    threshold = max(min_density, 30)  # post-stretch threshold
+    # Walls are the brightest features (dense scan hits). Furniture,
+    # scanner glow, and other interior objects are dimmer.
+    # Use Otsu's method on the non-zero stretched pixels to find the
+    # natural wall/non-wall boundary, then take the higher of Otsu vs
+    # a minimum floor to avoid picking up furniture.
+    threshold = _otsu_threshold(stretched)
+    # Enforce a reasonable minimum — never go below 40% of the range
+    threshold = max(threshold, 100, min_density)
+    print(f"  Threshold: {threshold} (walls must be >= this brightness)")
     binary = (stretched >= threshold).astype(np.uint8)
     n_wall_px = binary.sum()
     print(f"  Binary mask: {n_wall_px:,} wall pixels "
@@ -751,6 +804,123 @@ def export_dxf(segments, out_path, origin_offset=True):
     print(f"  Extents: {width:.2f}m x {height:.2f}m")
 
 
+def export_dxf_with_image(segments, image_path, image_size, resolution,
+                           origin, out_path, origin_offset=True):
+    """Export wall segments + the source orthoimage as a DXF underlay.
+
+    Creates a DXF with:
+      - SCAN_IMAGE layer: the PNG orthoimage as a raster background
+      - WALLS layer: traced wall line segments on top
+      - DIMENSIONS layer: bounding dimensions
+
+    Args:
+        segments: List of ((x1,y1), (x2,y2)) wall segments.
+        image_path: Absolute path to the source PNG image file.
+        image_size: (width_px, height_px) of the image.
+        resolution: Metres per pixel.
+        origin: (x_min, y_min) world coordinate origin of the image.
+        out_path: Output DXF file path.
+        origin_offset: If True, shift geometry so bottom-left is near origin.
+    """
+    import ezdxf
+    from ezdxf import units
+
+    doc = ezdxf.new("R2010")
+    doc.units = units.M
+
+    doc.layers.add("SCAN_IMAGE", color=8)   # Dark grey
+    doc.layers.add("WALLS", color=7)        # White/black
+    doc.layers.add("DIMENSIONS", color=6)   # Magenta
+
+    msp = doc.modelspace()
+
+    # Compute the shift (same as export_dxf)
+    if segments:
+        all_pts = np.array([(p[0], p[1]) for seg in segments for p in seg])
+        if origin_offset:
+            shift = all_pts.min(axis=0) - 1.0
+        else:
+            shift = np.zeros(2)
+    else:
+        shift = np.array([origin[0], origin[1]]) - 1.0
+
+    # --- Insert the raster image ---
+    img_w, img_h = image_size
+    # Image insert point = origin shifted
+    insert_x = origin[0] - shift[0]
+    insert_y = origin[1] - shift[1]
+
+    # Image size in world units
+    world_w = img_w * resolution
+    world_h = img_h * resolution
+
+    # Use an absolute path for the image reference
+    abs_image_path = os.path.abspath(image_path)
+
+    try:
+        # Define the image
+        image_def = doc.add_image_def(
+            filename=abs_image_path,
+            size_in_pixel=(img_w, img_h),
+        )
+
+        # Insert into modelspace on the SCAN_IMAGE layer
+        # The image is inserted at (insert_x, insert_y) with the
+        # size scaled to match world coordinates.
+        # DXF IMAGE entity uses a size vector (u, v) for pixel scaling.
+        msp.add_image(
+            insert=(insert_x, insert_y),
+            size_in_units=(world_w, world_h),
+            image_def=image_def,
+            rotation=0,
+            dxfattribs={"layer": "SCAN_IMAGE"},
+        )
+        print(f"  Added image underlay: {img_w}x{img_h}px "
+              f"({world_w:.1f}x{world_h:.1f}m)")
+    except Exception as e:
+        print(f"  WARNING: Could not embed image: {e}")
+        print(f"  (Wall lines will still be exported)")
+
+    # --- Add wall segments ---
+    for (x1, y1), (x2, y2) in segments:
+        msp.add_line(
+            (x1 - shift[0], y1 - shift[1]),
+            (x2 - shift[0], y2 - shift[1]),
+            dxfattribs={"layer": "WALLS"},
+        )
+
+    # --- Add dimensions ---
+    if segments:
+        shifted = all_pts - shift
+        min_x, min_y = shifted.min(axis=0)
+        max_x, max_y = shifted.max(axis=0)
+        width = max_x - min_x
+        height = max_y - min_y
+
+        dim_offset = max(width, height) * 0.05 + 0.5
+
+        dim_style = doc.dimstyles.new("PLAN")
+        dim_style.dxf.dimtxt = max(width, height) * 0.015
+        dim_style.dxf.dimasz = max(width, height) * 0.01
+
+        msp.add_linear_dim(
+            base=(min_x, min_y - dim_offset),
+            p1=(min_x, min_y), p2=(max_x, min_y),
+            dimstyle="PLAN",
+            dxfattribs={"layer": "DIMENSIONS"},
+        ).render()
+
+        msp.add_linear_dim(
+            base=(min_x - dim_offset, min_y),
+            p1=(min_x, min_y), p2=(min_x, max_y),
+            angle=90, dimstyle="PLAN",
+            dxfattribs={"layer": "DIMENSIONS"},
+        ).render()
+
+    doc.saveas(out_path)
+    print(f"  Saved DXF+image: {out_path}")
+
+
 # ---------------------------------------------------------------------------
 # 6. Optional: save the orthoimage as PNG
 # ---------------------------------------------------------------------------
@@ -973,6 +1143,7 @@ def run_pipeline(input_path, output_dir=None, output_dxf=None,
     image, origin, res = rasterize(points_2d, resolution)
 
     # 7. Save orthoimage
+    img_path = None
     if save_image:
         img_path = os.path.join(output_dir, f"{basename}_ortho.png")
         save_orthoimage(image, img_path)
@@ -981,8 +1152,20 @@ def run_pipeline(input_path, output_dir=None, output_dxf=None,
     print("  Detecting walls...")
     segments = detect_walls(image, origin, res, min_density=min_density)
 
-    # 9. Export DXF
+    # 9. Export DXF (walls only)
     export_dxf(segments, output_dxf)
+
+    # 10. Export DXF with orthoimage underlay
+    if img_path and os.path.isfile(img_path):
+        overlay_path = os.path.join(output_dir, f"{basename}_plan_overlay.dxf")
+        export_dxf_with_image(
+            segments,
+            image_path=os.path.abspath(img_path),
+            image_size=(image.shape[1], image.shape[0]),
+            resolution=res,
+            origin=origin,
+            out_path=overlay_path,
+        )
 
     return output_dxf
 
@@ -1035,6 +1218,12 @@ def run_pipeline_from_image(image_path, output_dxf=None, resolution=0.02,
         origin = (0.0, 0.0)
         print(f"  No worldfile found, using --resolution={resolution} m/px")
 
+    # Remember original image info for the overlay DXF
+    # (overlay references the full-res source image, not the downscaled copy)
+    orig_image_path = os.path.abspath(image_path)
+    orig_image_size = (image.shape[1], image.shape[0])
+    orig_resolution = resolution
+
     # Downscale if the image is very large
     total_pixels = image.shape[0] * image.shape[1]
     if total_pixels > max_pixels:
@@ -1044,22 +1233,19 @@ def run_pipeline_from_image(image_path, output_dxf=None, resolution=0.02,
         print(f"  Downscaling: {image.shape[1]}x{image.shape[0]} -> "
               f"{new_w}x{new_h} ({scale_factor:.2f}x)")
 
-        # Use PIL for quality downscale if available, else numpy
         try:
             from PIL import Image as PILImage
             pil_img = PILImage.fromarray(image)
             pil_img = pil_img.resize((new_w, new_h), PILImage.LANCZOS)
             image = np.array(pil_img, dtype=np.uint8)
         except ImportError:
-            # Simple block-mean downscale
             bh = image.shape[0] // new_h
             bw = image.shape[1] // new_w
             image = image[:new_h * bh, :new_w * bw]
             image = image.reshape(new_h, bh, new_w, bw).max(axis=(1, 3)).astype(np.uint8)
 
-        # Adjust resolution to compensate for downscale
+        # Adjust resolution for wall detection on the downscaled image
         resolution = resolution / scale_factor
-        # Adjust origin (worldfile origin doesn't change)
         print(f"  Adjusted resolution: {resolution:.4f} m/px")
 
     print(f"  Real-world extents: "
@@ -1068,7 +1254,22 @@ def run_pipeline_from_image(image_path, output_dxf=None, resolution=0.02,
     print("  Detecting walls...")
     segments = detect_walls(image, origin, resolution, min_density=min_density)
 
+    # 1. Walls-only DXF
     export_dxf(segments, output_dxf)
+
+    # 2. DXF with image underlay (secondary output)
+    overlay_path = os.path.join(
+        output_dir, f"{basename}_plan_overlay.dxf"
+    )
+    export_dxf_with_image(
+        segments,
+        image_path=orig_image_path,
+        image_size=orig_image_size,
+        resolution=orig_resolution,
+        origin=origin,
+        out_path=overlay_path,
+    )
+
     return output_dxf
 
 
