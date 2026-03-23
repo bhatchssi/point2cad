@@ -323,8 +323,8 @@ def detect_walls(image, origin, resolution, min_density=3,
             continue
 
         # Measure thickness along this chain (median half-width * 2)
-        chain_rows = chain[:, 0]
-        chain_cols = chain[:, 1]
+        chain_rows = chain[:, 0].astype(np.intp)
+        chain_cols = chain[:, 1].astype(np.intp)
         half_widths = skel_thickness[chain_rows, chain_cols]
         # Filter out zeros (shouldn't happen on skeleton, but be safe)
         valid = half_widths[half_widths > 0]
