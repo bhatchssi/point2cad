@@ -456,7 +456,53 @@ def save_orthoimage(image, out_path):
 
 
 # ---------------------------------------------------------------------------
-# 7. Main pipeline
+# 7. Load a pre-rendered PNG/JPG orthoimage
+# ---------------------------------------------------------------------------
+
+def load_image(path):
+    """Load a grayscale image from PNG/JPG/BMP/PGM.
+
+    Returns a 2D uint8 numpy array (grayscale).
+    """
+    try:
+        from PIL import Image
+        img = Image.open(path).convert("L")
+        return np.array(img, dtype=np.uint8)
+    except ImportError:
+        pass
+
+    # Fallback: try PGM (our own save format)
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pgm":
+        return _read_pgm(path)
+
+    raise ImportError(
+        f"Pillow is required to read {ext} images. "
+        "Install with: pip install Pillow"
+    )
+
+
+def _read_pgm(path):
+    """Read a binary PGM (P5) file without Pillow."""
+    with open(path, "rb") as f:
+        magic = f.readline().strip()
+        if magic != b"P5":
+            raise ValueError(f"Not a PGM file: {path}")
+        # Skip comments
+        line = f.readline()
+        while line.startswith(b"#"):
+            line = f.readline()
+        w, h = map(int, line.split())
+        maxval = int(f.readline().strip())
+        data = f.read()
+    image = np.frombuffer(data, dtype=np.uint8).reshape((h, w))
+    if maxval != 255:
+        image = (image.astype(np.float32) / maxval * 255).astype(np.uint8)
+    return image
+
+
+# ---------------------------------------------------------------------------
+# 8. Main pipelines
 # ---------------------------------------------------------------------------
 
 def run_pipeline(input_path, output_dir=None, output_dxf=None,
@@ -529,19 +575,69 @@ def run_pipeline(input_path, output_dir=None, output_dxf=None,
     return output_dxf
 
 
+def run_pipeline_from_image(image_path, output_dxf=None, resolution=0.02,
+                            min_density=3, invert=False):
+    """Run wall detection + DXF export from a pre-rendered PNG orthoimage.
+
+    Skips point cloud loading, slicing, and rasterization — reads the image
+    and traces walls directly.
+
+    Args:
+        image_path: Path to a grayscale PNG/JPG/BMP/PGM image. Bright pixels
+            are treated as walls (high point density). Use invert=True if
+            walls are dark on a light background.
+        output_dxf: Output DXF path (default: <image_name>_plan.dxf).
+        resolution: Metres per pixel — controls the real-world scale of the
+            output DXF. E.g. 0.02 means each pixel = 2cm.
+        min_density: Minimum pixel brightness (0-255) to consider as wall.
+        invert: If True, invert the image (dark pixels become walls).
+
+    Returns:
+        Path to the output DXF file.
+    """
+    basename = os.path.splitext(os.path.basename(image_path))[0]
+    output_dir = os.path.dirname(image_path) or "."
+
+    if output_dxf is None:
+        output_dxf = os.path.join(output_dir, f"{basename}_plan.dxf")
+
+    print(f"Reading image: {image_path}")
+    image = load_image(image_path)
+    print(f"  Image size: {image.shape[1]} x {image.shape[0]} pixels")
+    print(f"  Resolution: {resolution} m/px "
+          f"=> {image.shape[1]*resolution:.1f}m x {image.shape[0]*resolution:.1f}m")
+
+    if invert:
+        image = 255 - image
+        print("  Inverted image (dark walls -> bright)")
+
+    # Origin at (0, 0) — bottom-left of the image in world coords
+    origin = (0.0, 0.0)
+
+    print("  Detecting walls...")
+    segments = detect_walls(image, origin, resolution, min_density=min_density)
+
+    export_dxf(segments, output_dxf)
+    return output_dxf
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".pgm"}
+
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Slice a point cloud and generate a 2D floor plan (DXF)"
+        description="Generate a 2D floor plan (DXF) from a point cloud or "
+                    "a flattened orthoimage (PNG/JPG)."
     )
     parser.add_argument(
         "input", type=str,
-        help="Input point cloud file (LAZ, LAS, PLY, E57, PTS, PTX, XYZ)",
+        help="Input file: point cloud (LAZ/LAS/PLY/E57) or image (PNG/JPG/BMP)",
     )
     parser.add_argument(
         "--output", type=str, default=None,
@@ -552,38 +648,62 @@ if __name__ == "__main__":
         help="Output directory (default: same as input file)",
     )
     parser.add_argument(
-        "--slice_height", type=float, default=None,
-        help="Z height for the horizontal slice in metres (default: auto-detect)",
-    )
-    parser.add_argument(
-        "--thickness", type=float, default=0.3,
-        help="Slab thickness in metres (default: 0.3)",
-    )
-    parser.add_argument(
         "--resolution", type=float, default=0.02,
-        help="Raster resolution in metres/pixel (default: 0.02 = 2cm)",
+        help="Metres per pixel (default: 0.02 = 2cm). For image inputs this "
+             "sets the real-world scale; for point clouds it sets the raster "
+             "grid size.",
     )
     parser.add_argument(
         "--min_density", type=int, default=3,
-        help="Minimum raster pixel density for wall detection (default: 3)",
+        help="Minimum pixel brightness for wall detection (default: 3)",
     )
     parser.add_argument(
+        "--invert", action="store_true", default=False,
+        help="Invert the image (use when walls are dark on light background)",
+    )
+
+    # Point-cloud-only options
+    pc_group = parser.add_argument_group("Point cloud options")
+    pc_group.add_argument(
+        "--slice_height", type=float, default=None,
+        help="Z height for the horizontal slice in metres (default: auto)",
+    )
+    pc_group.add_argument(
+        "--thickness", type=float, default=0.3,
+        help="Slab thickness in metres (default: 0.3)",
+    )
+    pc_group.add_argument(
         "--no_image", action="store_true", default=False,
         help="Skip saving the orthoimage PNG",
     )
 
     args = parser.parse_args()
 
-    result = run_pipeline(
-        args.input,
-        output_dir=args.output_dir,
-        output_dxf=args.output,
-        slice_height=args.slice_height,
-        thickness=args.thickness,
-        resolution=args.resolution,
-        min_density=args.min_density,
-        save_image=not args.no_image,
-    )
+    # Auto-detect mode based on file extension
+    ext = os.path.splitext(args.input)[1].lower()
+    is_image = ext in _IMAGE_EXTENSIONS
+
+    if is_image:
+        print(f"Image mode: reading {ext} file directly")
+        result = run_pipeline_from_image(
+            args.input,
+            output_dxf=args.output,
+            resolution=args.resolution,
+            min_density=args.min_density,
+            invert=args.invert,
+        )
+    else:
+        print(f"Point cloud mode: reading {ext} file")
+        result = run_pipeline(
+            args.input,
+            output_dir=args.output_dir,
+            output_dxf=args.output,
+            slice_height=args.slice_height,
+            thickness=args.thickness,
+            resolution=args.resolution,
+            min_density=args.min_density,
+            save_image=not args.no_image,
+        )
 
     if result:
         print(f"\nDone! Floor plan saved to: {result}")
