@@ -1004,38 +1004,226 @@ def _rdp_simplify(points, tolerance):
 # 5. DXF export
 # ---------------------------------------------------------------------------
 
-def _offset_segment(x1, y1, x2, y2, half_t):
-    """Compute the two parallel offset lines for a wall segment.
+def _line_intersection(p1, d1, p2, d2):
+    """Find intersection of two infinite lines defined by point + direction.
 
-    Given a centreline from (x1,y1) to (x2,y2) and half-thickness,
-    returns two pairs of endpoints — one for each wall face.
+    Line 1: p1 + t*d1,  Line 2: p2 + s*d2
 
     Returns:
-        ((lx1,ly1,lx2,ly2), (rx1,ry1,rx2,ry2))  — left and right faces.
+        (x, y) intersection point, or None if lines are parallel.
     """
-    dx, dy = x2 - x1, y2 - y1
-    length = np.sqrt(dx*dx + dy*dy)
-    if length < 1e-12:
-        return None
-    # Normal vector (perpendicular to segment direction)
-    nx = -dy / length * half_t
-    ny = dx / length * half_t
-    return (
-        (x1 + nx, y1 + ny, x2 + nx, y2 + ny),  # left face
-        (x1 - nx, y1 - ny, x2 - nx, y2 - ny),  # right face
-    )
+    # Solve: p1 + t*d1 = p2 + s*d2
+    # d1x*t - d2x*s = p2x - p1x
+    # d1y*t - d2y*s = p2y - p1y
+    det = d1[0] * (-d2[1]) - d1[1] * (-d2[0])
+    if abs(det) < 1e-12:
+        return None  # parallel
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    t = (-d2[1] * dx + d2[0] * dy) / det
+    return (p1[0] + t * d1[0], p1[1] + t * d1[1])
+
+
+def _build_wall_geometry(segments, shift):
+    """Build double-line wall geometry with proper corner joins.
+
+    For each wall segment:
+      - Compute left/right offset lines (wall faces)
+      - At endpoints where walls meet, compute miter intersections
+        so the wall faces join cleanly
+      - At free endpoints, draw end caps
+
+    Args:
+        segments: List of ((x1,y1),(x2,y2), thickness) tuples.
+        shift: (sx, sy) coordinate shift applied to all points.
+
+    Returns:
+        List of dicts with keys:
+          'left': ((x1,y1),(x2,y2))  — left wall face
+          'right': ((x1,y1),(x2,y2)) — right wall face
+          'centre': ((x1,y1),(x2,y2)) — centreline
+          'caps': list of ((x1,y1),(x2,y2)) end cap lines
+    """
+    if not segments:
+        return []
+
+    # --- 1. Prepare shifted centrelines and normals ---
+    walls = []  # per-wall data
+    for seg in segments:
+        (x1, y1), (x2, y2) = seg[0], seg[1]
+        thickness = seg[2] if len(seg) > 2 else 0.15
+        half_t = thickness / 2.0
+
+        x1s, y1s = x1 - shift[0], y1 - shift[1]
+        x2s, y2s = x2 - shift[0], y2 - shift[1]
+
+        dx, dy = x2s - x1s, y2s - y1s
+        length = np.sqrt(dx*dx + dy*dy)
+        if length < 1e-12:
+            continue
+
+        ux, uy = dx / length, dy / length  # unit direction
+        nx, ny = -uy * half_t, ux * half_t  # normal * half_t
+
+        walls.append({
+            'p1': np.array([x1s, y1s]),
+            'p2': np.array([x2s, y2s]),
+            'dir': np.array([ux, uy]),
+            'normal': np.array([nx, ny]),
+            'half_t': half_t,
+            'thickness': thickness,
+            # Offset endpoints (will be modified by miter joins)
+            'L1': np.array([x1s + nx, y1s + ny]),
+            'L2': np.array([x2s + nx, y2s + ny]),
+            'R1': np.array([x1s - nx, y1s - ny]),
+            'R2': np.array([x2s - nx, y2s - ny]),
+            'cap_start': True,  # draw end cap at p1?
+            'cap_end': True,    # draw end cap at p2?
+        })
+
+    # --- 2. Build endpoint adjacency ---
+    # For each wall endpoint, find other walls that share approximately
+    # the same centreline endpoint (= junction).
+    n = len(walls)
+    join_radius = max(w['half_t'] for w in walls) * 2.5 if walls else 0.2
+
+    # Collect all endpoints: (x, y, wall_idx, end: 0=start, 1=end)
+    eps = []
+    for i, w in enumerate(walls):
+        eps.append((*w['p1'], i, 0))
+        eps.append((*w['p2'], i, 1))
+
+    ep_coords = np.array([(e[0], e[1]) for e in eps])
+
+    # Group into clusters
+    assigned = np.full(len(eps), -1, dtype=int)
+    clusters = []
+    for i in range(len(eps)):
+        if assigned[i] >= 0:
+            continue
+        dists = np.sqrt((ep_coords[:, 0] - ep_coords[i, 0])**2 +
+                        (ep_coords[:, 1] - ep_coords[i, 1])**2)
+        members = np.where((dists <= join_radius) & (assigned < 0))[0]
+        cid = len(clusters)
+        clusters.append(members.tolist())
+        for m in members:
+            assigned[m] = cid
+
+    # --- 3. Process each junction cluster ---
+    for cluster in clusters:
+        if len(cluster) < 2:
+            continue  # isolated endpoint — will get an end cap
+
+        # Get the walls and which end participates
+        participants = [(eps[j][2], eps[j][3]) for j in cluster]
+
+        # For each pair of walls meeting at this junction, compute miter
+        for a_idx in range(len(participants)):
+            for b_idx in range(a_idx + 1, len(participants)):
+                wi, ei = participants[a_idx]  # wall index, end (0/1)
+                wj, ej = participants[b_idx]
+                if wi == wj:
+                    continue
+
+                wa = walls[wi]
+                wb = walls[wj]
+
+                # Direction vectors pointing AWAY from the junction
+                da = wa['dir'] if ei == 0 else -wa['dir']
+                db = wb['dir'] if ej == 0 else -wb['dir']
+
+                # Skip near-parallel walls (handled by collinear merge)
+                cross = abs(da[0]*db[1] - da[1]*db[0])
+                if cross < 0.1:
+                    continue
+
+                # Compute miter intersections for L and R faces
+                # Wall A's left face at the junction end
+                na = wa['normal']
+                nb = wb['normal']
+
+                # The left offset line of wall A: point + t*dir
+                # At end 0: starts at L1, direction = wa['dir']
+                # At end 1: starts at L2, direction = -wa['dir']
+                a_L_pt = wa['L1'] if ei == 0 else wa['L2']
+                a_R_pt = wa['R1'] if ei == 0 else wa['R2']
+
+                # For wall B
+                b_L_pt = wb['L1'] if ej == 0 else wb['L2']
+                b_R_pt = wb['R1'] if ej == 0 else wb['R2']
+
+                # Try all four combinations and pick the ones that
+                # create clean intersections
+                for a_side, a_pt_key in [('L', ei), ('R', ei)]:
+                    a_pt = (wa[f'{a_side}1'] if a_pt_key == 0
+                            else wa[f'{a_side}2'])
+                    for b_side, b_pt_key in [('L', ej), ('R', ej)]:
+                        b_pt = (wb[f'{b_side}1'] if b_pt_key == 0
+                                else wb[f'{b_side}2'])
+
+                        ix = _line_intersection(
+                            a_pt, wa['dir'], b_pt, wb['dir']
+                        )
+                        if ix is None:
+                            continue
+
+                        ix = np.array(ix)
+                        # Only accept if the intersection is reasonably
+                        # close to the junction (within a few wall widths)
+                        junction_pt = wa['p1'] if ei == 0 else wa['p2']
+                        dist = np.linalg.norm(ix - junction_pt)
+                        max_dist = max(wa['half_t'], wb['half_t']) * 4
+                        if dist > max_dist:
+                            continue
+
+                        # Update the wall endpoints
+                        key_a = f'{a_side}{1 if a_pt_key == 0 else 2}'
+                        key_b = f'{b_side}{1 if b_pt_key == 0 else 2}'
+                        wa[key_a] = ix
+                        wb[key_b] = ix
+
+                # Mark this end as joined (no cap needed)
+                if ei == 0:
+                    wa['cap_start'] = False
+                else:
+                    wa['cap_end'] = False
+                if ej == 0:
+                    wb['cap_start'] = False
+                else:
+                    wb['cap_end'] = False
+
+    # --- 4. Build output geometry ---
+    result = []
+    for w in walls:
+        geom = {
+            'left': ((w['L1'][0], w['L1'][1]), (w['L2'][0], w['L2'][1])),
+            'right': ((w['R1'][0], w['R1'][1]), (w['R2'][0], w['R2'][1])),
+            'centre': ((w['p1'][0], w['p1'][1]), (w['p2'][0], w['p2'][1])),
+            'caps': [],
+        }
+        if w['cap_start']:
+            geom['caps'].append((
+                (w['L1'][0], w['L1'][1]),
+                (w['R1'][0], w['R1'][1]),
+            ))
+        if w['cap_end']:
+            geom['caps'].append((
+                (w['L2'][0], w['L2'][1]),
+                (w['R2'][0], w['R2'][1]),
+            ))
+        result.append(geom)
+
+    return result
 
 
 def export_dxf(segments, out_path, origin_offset=True):
     """Export wall segments as double-line walls to a DXF file.
 
-    Each wall segment is drawn as two parallel lines (both faces of the
-    wall) with end caps at terminations. A centreline layer is also
-    included for reference.
+    Each wall segment is drawn as two parallel lines (both faces) with
+    miter joins at corners and end caps at free endpoints.
 
     Args:
-        segments: List of ((x1,y1), (x2,y2), thickness) tuples in world
-            coordinates (metres). thickness is the wall width.
+        segments: List of ((x1,y1), (x2,y2), thickness) tuples.
         out_path: Output DXF file path.
         origin_offset: If True, shift geometry so bottom-left is near origin.
     """
@@ -1045,12 +1233,11 @@ def export_dxf(segments, out_path, origin_offset=True):
     doc = ezdxf.new("R2010")
     doc.units = units.M
 
-    doc.layers.add("WALLS", color=7)         # Wall faces (white/black)
-    doc.layers.add("WALL_CAPS", color=7)     # End caps (same colour)
-    doc.layers.add("CENTRELINE", color=8)    # Centreline (dark grey)
-    doc.layers.add("DIMENSIONS", color=6)    # Magenta
+    doc.layers.add("WALLS", color=7)
+    doc.layers.add("WALL_CAPS", color=7)
+    doc.layers.add("CENTRELINE", color=8)
+    doc.layers.add("DIMENSIONS", color=6)
 
-    # Make centreline layer non-printing and initially off
     cl_layer = doc.layers.get("CENTRELINE")
     cl_layer.off()
 
@@ -1061,7 +1248,7 @@ def export_dxf(segments, out_path, origin_offset=True):
         doc.saveas(out_path)
         return
 
-    # Extract point coords (first two elements of each tuple)
+    # Compute shift
     all_pts = np.array([(p[0], p[1])
                         for seg in segments
                         for p in (seg[0], seg[1])])
@@ -1070,67 +1257,26 @@ def export_dxf(segments, out_path, origin_offset=True):
     else:
         shift = np.zeros(2)
 
-    # Collect all offset endpoints for endpoint-proximity checking
-    # (to decide where to draw end caps vs. leave open for connections)
-    all_endpoints = []
-    seg_offsets = []
+    # Build wall geometry with proper corner joins
+    wall_geoms = _build_wall_geometry(segments, shift)
 
-    for seg in segments:
-        (x1, y1), (x2, y2) = seg[0], seg[1]
-        thickness = seg[2] if len(seg) > 2 else 0.15  # fallback 15cm
-        half_t = thickness / 2.0
+    n_joins = sum(1 for g in wall_geoms
+                  if not any(g['caps']))  # walls with no caps = fully joined
+    print(f"  Corner joins: {n_joins} walls fully joined at both ends")
 
-        x1s, y1s = x1 - shift[0], y1 - shift[1]
-        x2s, y2s = x2 - shift[0], y2 - shift[1]
-
-        result = _offset_segment(x1s, y1s, x2s, y2s, half_t)
-        if result is None:
-            continue
-
-        left, right = result
-        seg_offsets.append((left, right, (x1s, y1s), (x2s, y2s), thickness))
-        all_endpoints.append((x1s, y1s))
-        all_endpoints.append((x2s, y2s))
-
-    all_ep = np.array(all_endpoints) if all_endpoints else np.empty((0, 2))
-
-    for left, right, (x1s, y1s), (x2s, y2s), thickness in seg_offsets:
-        lx1, ly1, lx2, ly2 = left
-        rx1, ry1, rx2, ry2 = right
-
-        # Draw the two wall faces
-        msp.add_line((lx1, ly1), (lx2, ly2),
+    for geom in wall_geoms:
+        # Wall faces
+        msp.add_line(geom['left'][0], geom['left'][1],
                      dxfattribs={"layer": "WALLS"})
-        msp.add_line((rx1, ry1), (rx2, ry2),
+        msp.add_line(geom['right'][0], geom['right'][1],
                      dxfattribs={"layer": "WALLS"})
-
-        # Draw centreline (reference, initially hidden)
-        msp.add_line((x1s, y1s), (x2s, y2s),
+        # Centreline
+        msp.add_line(geom['centre'][0], geom['centre'][1],
                      dxfattribs={"layer": "CENTRELINE"})
-
-        # End caps: draw a perpendicular line at each endpoint
-        # UNLESS another segment's endpoint is very close (= wall junction)
-        half_t = thickness / 2.0
-        cap_threshold = half_t * 1.5  # don't cap if another wall is nearby
-
-        for end_idx, (ex, ey) in enumerate([(x1s, y1s), (x2s, y2s)]):
-            # Count how many OTHER endpoints are within cap_threshold
-            if len(all_ep) > 0:
-                dists = np.sqrt((all_ep[:, 0] - ex)**2 +
-                                (all_ep[:, 1] - ey)**2)
-                # Exclude self (distance ~0)
-                nearby = np.sum((dists > 0.001) & (dists < cap_threshold))
-            else:
-                nearby = 0
-
-            if nearby == 0:
-                # Isolated endpoint — draw end cap
-                if end_idx == 0:
-                    msp.add_line((lx1, ly1), (rx1, ry1),
-                                 dxfattribs={"layer": "WALL_CAPS"})
-                else:
-                    msp.add_line((lx2, ly2), (rx2, ry2),
-                                 dxfattribs={"layer": "WALL_CAPS"})
+        # End caps
+        for cap in geom['caps']:
+            msp.add_line(cap[0], cap[1],
+                         dxfattribs={"layer": "WALL_CAPS"})
 
     # Add bounding dimensions
     shifted = all_pts - shift
@@ -1243,24 +1389,16 @@ def export_dxf_with_image(segments, image_path, image_size, resolution,
         print(f"  WARNING: Could not embed image: {e}")
         print(f"  (Wall lines will still be exported)")
 
-    # --- Add wall segments (double-line) ---
-    for seg in segments:
-        (x1, y1), (x2, y2) = seg[0], seg[1]
-        thickness = seg[2] if len(seg) > 2 else 0.15
-        half_t = thickness / 2.0
-
-        x1s, y1s = x1 - shift[0], y1 - shift[1]
-        x2s, y2s = x2 - shift[0], y2 - shift[1]
-
-        result = _offset_segment(x1s, y1s, x2s, y2s, half_t)
-        if result is None:
-            continue
-
-        left, right = result
-        msp.add_line((left[0], left[1]), (left[2], left[3]),
+    # --- Add wall segments (double-line with corner joins) ---
+    wall_geoms = _build_wall_geometry(segments, shift)
+    for geom in wall_geoms:
+        msp.add_line(geom['left'][0], geom['left'][1],
                      dxfattribs={"layer": "WALLS"})
-        msp.add_line((right[0], right[1]), (right[2], right[3]),
+        msp.add_line(geom['right'][0], geom['right'][1],
                      dxfattribs={"layer": "WALLS"})
+        for cap in geom['caps']:
+            msp.add_line(cap[0], cap[1],
+                         dxfattribs={"layer": "WALLS"})
 
     # --- Add dimensions ---
     if segments:
