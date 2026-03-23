@@ -284,6 +284,12 @@ def detect_walls(image, origin, resolution, min_density=3,
                     ((p1[0], p1[1]), (p2[0], p2[1]))
                 )
 
+    # --- 7. Orthogonal snapping ---
+    # Detect building's dominant axis from long walls, then snap all
+    # segments to the nearest 90-degree multiple of that axis. Short
+    # segments (door/window casings) get snapped more aggressively.
+    all_segments = _snap_to_orthogonal(all_segments, resolution)
+
     print(f"  Final: {len(all_segments)} wall segments")
     return all_segments
 
@@ -343,6 +349,143 @@ def _merge_collinear(segments, angle_tol=5.0, gap_tol=0.1):
     # Emit the last segment
     merged.append((cur_start, cur_end))
     return merged
+
+
+def _snap_to_orthogonal(segments, resolution, long_threshold=1.0,
+                         snap_tol_long=8.0, snap_tol_short=15.0):
+    """Snap segments to the building's dominant orthogonal axes.
+
+    Buildings are typically axis-aligned: most walls run along two
+    perpendicular directions. This function:
+      1. Finds the dominant axis by computing a weighted angle histogram
+         of all segments (longer walls vote more).
+      2. Defines 4 cardinal directions: dominant, dominant+90, dominant+180,
+         dominant+270.
+      3. Snaps each segment to the nearest cardinal direction:
+         - Long walls (>= long_threshold): snap if within snap_tol_long degrees
+         - Short segments (casings): snap if within snap_tol_short degrees
+
+    Snapping rotates the segment around its midpoint to the exact cardinal
+    angle while preserving its length.
+
+    Args:
+        segments: List of ((x1,y1),(x2,y2)) tuples.
+        resolution: Grid resolution (metres) for context.
+        long_threshold: Length above which a segment is "long" (metres).
+        snap_tol_long: Max angle deviation to snap long segments (degrees).
+        snap_tol_short: Max angle deviation to snap short segments (degrees).
+
+    Returns:
+        New list of snapped ((x1,y1),(x2,y2)) segments.
+    """
+    if len(segments) < 2:
+        return segments
+
+    # --- Compute segment angles and lengths ---
+    angles = []  # in [0, 180) degrees
+    lengths = []
+    for (x1, y1), (x2, y2) in segments:
+        dx, dy = x2 - x1, y2 - y1
+        angle = np.degrees(np.arctan2(dy, dx)) % 180.0
+        length = np.sqrt(dx * dx + dy * dy)
+        angles.append(angle)
+        lengths.append(length)
+
+    angles = np.array(angles)
+    lengths = np.array(lengths)
+
+    # --- Find dominant axis via weighted histogram ---
+    # Use 1-degree bins over [0, 180)
+    n_bins = 180
+    hist = np.zeros(n_bins, dtype=np.float64)
+    for a, l in zip(angles, lengths):
+        bin_idx = int(a) % n_bins
+        hist[bin_idx] += l
+
+    # Smooth the histogram to handle jitter
+    from scipy.ndimage import gaussian_filter1d
+    # Wrap-around smoothing: extend, smooth, crop
+    extended = np.concatenate([hist[-10:], hist, hist[:10]])
+    smoothed = gaussian_filter1d(extended, sigma=3.0)
+    hist_smooth = smoothed[10:-10]
+
+    # Find the peak = dominant building axis
+    dominant_angle = np.argmax(hist_smooth)
+
+    # Also check if there's a clear secondary peak ~90 degrees away
+    # (validates that we found a real building axis, not noise)
+    secondary_angle = (dominant_angle + 90) % 180
+    secondary_region = hist_smooth[
+        max(0, secondary_angle - 5):min(180, secondary_angle + 6)
+    ]
+    has_secondary = secondary_region.sum() > 0
+
+    total_length = lengths.sum()
+    dominant_weight = hist_smooth[
+        max(0, dominant_angle - 5):min(180, dominant_angle + 6)
+    ].sum()
+    pct = 100 * dominant_weight / total_length if total_length > 0 else 0
+
+    print(f"  Dominant axis: {dominant_angle}° "
+          f"({pct:.0f}% of wall length), "
+          f"secondary {'found' if has_secondary else 'weak'} at {secondary_angle}°")
+
+    # --- Define the 4 cardinal directions ---
+    # Angles in [0, 180) for the 4 axes (each direction and its reverse
+    # map to the same [0,180) angle, so we only need 2 unique values)
+    axis_angles = [dominant_angle % 180, (dominant_angle + 90) % 180]
+
+    # --- Snap each segment ---
+    snapped = []
+    n_snapped = 0
+
+    for i, ((x1, y1), (x2, y2)) in enumerate(segments):
+        seg_angle = angles[i]
+        seg_len = lengths[i]
+        is_long = seg_len >= long_threshold
+        tol = snap_tol_long if is_long else snap_tol_short
+
+        # Find nearest axis angle
+        best_axis = None
+        best_diff = 999.0
+        for ax in axis_angles:
+            diff = abs(seg_angle - ax)
+            if diff > 90:
+                diff = 180 - diff
+            if diff < best_diff:
+                best_diff = diff
+                best_axis = ax
+
+        if best_diff <= tol:
+            # Snap: rotate segment around midpoint to exact axis angle
+            mid_x = (x1 + x2) / 2.0
+            mid_y = (y1 + y2) / 2.0
+            half_len = seg_len / 2.0
+
+            # Determine which direction along the axis to use
+            # (preserve the original direction sense)
+            orig_rad = np.radians(seg_angle)
+            ax_rad = np.radians(best_axis)
+            # Check if we need the 180-flipped version
+            dot = np.cos(orig_rad) * np.cos(ax_rad) + np.sin(orig_rad) * np.sin(ax_rad)
+            if dot < 0:
+                ax_rad += np.pi
+
+            dx = np.cos(ax_rad) * half_len
+            dy = np.sin(ax_rad) * half_len
+
+            snapped.append((
+                (mid_x - dx, mid_y - dy),
+                (mid_x + dx, mid_y + dy),
+            ))
+            n_snapped += 1
+        else:
+            # Keep as-is
+            snapped.append(((x1, y1), (x2, y2)))
+
+    print(f"  Snapped {n_snapped}/{len(segments)} segments to "
+          f"{dominant_angle}°/{secondary_angle}° axes")
+    return snapped
 
 
 def _skeletonize_proper(binary):
