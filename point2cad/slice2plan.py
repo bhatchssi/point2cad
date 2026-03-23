@@ -209,6 +209,9 @@ def detect_walls(image, origin, resolution, min_density=3,
                  morph_iterations=None):
     """Detect wall segments from a scanner orthoimage.
 
+    Returns both centreline segments and their measured thicknesses so that
+    the DXF exporter can draw double-line walls (both faces).
+
     Args:
         image: 2D uint8 density image (bright = walls, dark = empty).
         origin: (x_min, y_min) world coordinate origin.
@@ -219,7 +222,8 @@ def detect_walls(image, origin, resolution, min_density=3,
         morph_iterations: Unused, kept for CLI compatibility.
 
     Returns:
-        List of ((x1, y1), (x2, y2)) line segments in world coordinates.
+        List of ((x1,y1), (x2,y2), thickness) tuples in world coordinates.
+        thickness is the measured wall width in metres.
     """
     from scipy import ndimage
 
@@ -287,7 +291,13 @@ def detect_walls(image, origin, resolution, min_density=3,
         if n_removed > 0:
             print(f"  Removed {n_removed} noise blobs (< {min_blob}px)")
 
-    # --- 4. Skeletonize to 1px centrelines ---
+    # --- 4. Distance transform (for wall thickness measurement) ---
+    # The distance transform gives the distance from each wall pixel to
+    # the nearest background pixel. At the skeleton (centreline), this
+    # equals half the wall thickness.
+    dist_transform = ndimage.distance_transform_edt(binary)
+
+    # --- 5. Skeletonize to 1px centrelines ---
     skeleton = _skeletonize_proper(binary)
     n_skel = skeleton.sum()
     print(f"  Skeleton: {n_skel:,} pixels")
@@ -295,19 +305,34 @@ def detect_walls(image, origin, resolution, min_density=3,
     if n_skel == 0:
         return []
 
-    # --- 5. Chain skeleton pixels into polylines ---
+    # Measure half-thickness at each skeleton pixel
+    skel_thickness = dist_transform * skeleton  # zero except on skeleton
+
+    # --- 6. Chain skeleton pixels into polylines ---
     polylines = _chain_skeleton(skeleton)
     print(f"  Chained into {len(polylines)} polylines")
 
-    # --- 6. Convert to world coords, simplify, merge collinear ---
+    # --- 7. Convert to world coords, simplify, merge collinear ---
     min_px_len = max(3, int(min_line_length / resolution))
     # Use a shorter minimum for small features (window casings, etc.)
     min_short = min_line_length * 0.4
-    all_segments = []
+    all_segments = []  # will hold ((x1,y1),(x2,y2), thickness)
 
     for chain in polylines:
         if len(chain) < min_px_len:
             continue
+
+        # Measure thickness along this chain (median half-width * 2)
+        chain_rows = chain[:, 0]
+        chain_cols = chain[:, 1]
+        half_widths = skel_thickness[chain_rows, chain_cols]
+        # Filter out zeros (shouldn't happen on skeleton, but be safe)
+        valid = half_widths[half_widths > 0]
+        if len(valid) > 0:
+            median_half = np.median(valid)
+            chain_thickness = median_half * 2.0 * resolution  # in metres
+        else:
+            chain_thickness = resolution * 4  # fallback: ~2 pixels wide
 
         # Convert (row, col) to world (x, y)
         world_pts = np.empty((len(chain), 2), dtype=np.float64)
@@ -334,14 +359,36 @@ def detect_walls(image, origin, resolution, min_density=3,
             seg_len = np.linalg.norm(p2 - p1)
             if seg_len >= min_short:
                 all_segments.append(
-                    ((p1[0], p1[1]), (p2[0], p2[1]))
+                    ((p1[0], p1[1]), (p2[0], p2[1]), chain_thickness)
                 )
 
-    # --- 7. Orthogonal snapping ---
-    # Detect building's dominant axis from long walls, then snap all
-    # segments to the nearest 90-degree multiple of that axis. Short
-    # segments (door/window casings) get snapped more aggressively.
-    all_segments = _snap_to_orthogonal(all_segments, resolution)
+    # --- 8. Orthogonal snapping ---
+    # Extract just the segment pairs for snapping, then reattach thickness
+    seg_pairs = [(s[0], s[1]) for s in all_segments]
+    thicknesses = [s[2] for s in all_segments]
+    snapped_pairs = _snap_to_orthogonal(seg_pairs, resolution)
+
+    # Reattach thickness (snapping may have removed degenerate segments)
+    # Build a mapping from original to snapped
+    if len(snapped_pairs) == len(seg_pairs):
+        all_segments = [(p1, p2, t)
+                        for (p1, p2), t in zip(snapped_pairs, thicknesses)]
+    else:
+        # Snapping removed some segments; use median thickness as fallback
+        med_t = np.median(thicknesses) if thicknesses else resolution * 4
+        all_segments = [(p1, p2, med_t) for p1, p2 in snapped_pairs]
+
+    # Clamp wall thickness to reasonable bounds
+    min_t = resolution * 2   # at least 2 pixels
+    max_t = resolution * 30  # at most ~60cm at 0.02 res
+    all_segments = [(p1, p2, max(min_t, min(t, max_t)))
+                    for p1, p2, t in all_segments]
+
+    # Report typical wall thickness
+    if all_segments:
+        ts = [s[2] for s in all_segments]
+        print(f"  Wall thickness: median {np.median(ts)*100:.0f}cm, "
+              f"range {min(ts)*100:.0f}-{max(ts)*100:.0f}cm")
 
     print(f"  Final: {len(all_segments)} wall segments")
     return all_segments
@@ -405,21 +452,17 @@ def _merge_collinear(segments, angle_tol=5.0, gap_tol=0.1):
 
 
 def _snap_to_orthogonal(segments, resolution, long_threshold=1.0,
-                         snap_tol_long=8.0, snap_tol_short=15.0):
+                         snap_tol_long=10.0, snap_tol_short=20.0):
     """Snap segments to the building's dominant orthogonal axes.
 
-    Buildings are typically axis-aligned: most walls run along two
-    perpendicular directions. This function:
-      1. Finds the dominant axis by computing a weighted angle histogram
-         of all segments (longer walls vote more).
-      2. Defines 4 cardinal directions: dominant, dominant+90, dominant+180,
-         dominant+270.
-      3. Snaps each segment to the nearest cardinal direction:
-         - Long walls (>= long_threshold): snap if within snap_tol_long degrees
-         - Short segments (casings): snap if within snap_tol_short degrees
-
-    Snapping rotates the segment around its midpoint to the exact cardinal
-    angle while preserving its length.
+    Three-pass approach:
+      1. **Axis detection**: find the dominant building angle with sub-degree
+         precision using a length-weighted circular mean of long segments.
+      2. **Angle snapping**: rotate each segment to the nearest cardinal
+         direction (dominant or dominant+90°) around its midpoint.
+      3. **Endpoint alignment**: snap nearby endpoints together so walls
+         meet cleanly at corners and T-junctions. Parallel walls at the
+         same offset get their endpoints aligned onto a common grid line.
 
     Args:
         segments: List of ((x1,y1),(x2,y2)) tuples.
@@ -434,93 +477,85 @@ def _snap_to_orthogonal(segments, resolution, long_threshold=1.0,
     if len(segments) < 2:
         return segments
 
-    # --- Compute segment angles and lengths ---
-    angles = []  # in [0, 180) degrees
-    lengths = []
+    # ------------------------------------------------------------------
+    # Pass 1: Sub-degree dominant axis detection
+    # ------------------------------------------------------------------
+    # Compute angle in [0, 180) for each segment
+    seg_data = []  # (angle_deg, length, midx, midy, (x1,y1), (x2,y2))
     for (x1, y1), (x2, y2) in segments:
         dx, dy = x2 - x1, y2 - y1
         angle = np.degrees(np.arctan2(dy, dx)) % 180.0
         length = np.sqrt(dx * dx + dy * dy)
-        angles.append(angle)
-        lengths.append(length)
+        seg_data.append((angle, length, (x1+x2)/2, (y1+y2)/2,
+                         (x1, y1), (x2, y2)))
 
-    angles = np.array(angles)
-    lengths = np.array(lengths)
+    angles = np.array([s[0] for s in seg_data])
+    lengths = np.array([s[1] for s in seg_data])
 
-    # --- Find dominant axis via weighted histogram ---
-    # Use 1-degree bins over [0, 180)
-    n_bins = 180
-    hist = np.zeros(n_bins, dtype=np.float64)
-    for a, l in zip(angles, lengths):
-        bin_idx = int(a) % n_bins
-        hist[bin_idx] += l
+    # Use only long segments for axis detection — they're the most
+    # reliable indicator of building orientation.
+    long_mask = lengths >= long_threshold
+    if long_mask.sum() < 3:
+        long_mask = lengths >= np.percentile(lengths, 50)
 
-    # Smooth the histogram to handle jitter
-    from scipy.ndimage import gaussian_filter1d
-    # Wrap-around smoothing: extend, smooth, crop
-    extended = np.concatenate([hist[-10:], hist, hist[:10]])
-    smoothed = gaussian_filter1d(extended, sigma=3.0)
-    hist_smooth = smoothed[10:-10]
+    long_angles = angles[long_mask]
+    long_lengths = lengths[long_mask]
 
-    # Find the peak = dominant building axis
-    dominant_angle = np.argmax(hist_smooth)
+    # Length-weighted circular mean in the angle-doubled domain
+    # (doubling maps [0,180) to [0,360) so 0° and 179° are neighbours)
+    theta2 = np.radians(long_angles * 2)
+    wx = np.sum(long_lengths * np.cos(theta2))
+    wy = np.sum(long_lengths * np.sin(theta2))
+    dominant_angle = (np.degrees(np.arctan2(wy, wx)) / 2) % 180.0
 
-    # Also check if there's a clear secondary peak ~90 degrees away
-    # (validates that we found a real building axis, not noise)
+    # Refine: weighted circular mean of segments within ±15° of the
+    # coarse peak, giving sub-degree accuracy.
+    near_mask = _angle_distance(long_angles, dominant_angle) < 15.0
+    if near_mask.sum() >= 2:
+        near_a = long_angles[near_mask]
+        near_l = long_lengths[near_mask]
+        theta2n = np.radians(near_a * 2)
+        wx2 = np.sum(near_l * np.cos(theta2n))
+        wy2 = np.sum(near_l * np.sin(theta2n))
+        dominant_angle = (np.degrees(np.arctan2(wy2, wx2)) / 2) % 180.0
+
     secondary_angle = (dominant_angle + 90) % 180
-    secondary_region = hist_smooth[
-        max(0, secondary_angle - 5):min(180, secondary_angle + 6)
-    ]
-    has_secondary = secondary_region.sum() > 0
+    axis_angles = [dominant_angle, secondary_angle]
 
-    total_length = lengths.sum()
-    dominant_weight = hist_smooth[
-        max(0, dominant_angle - 5):min(180, dominant_angle + 6)
-    ].sum()
-    pct = 100 * dominant_weight / total_length if total_length > 0 else 0
+    # Stats
+    near_dom = _angle_distance(angles, dominant_angle) < snap_tol_long
+    near_sec = _angle_distance(angles, secondary_angle) < snap_tol_long
+    pct = 100 * lengths[near_dom | near_sec].sum() / lengths.sum()
+    print(f"  Dominant axis: {dominant_angle:.1f}° "
+          f"({pct:.0f}% of wall length near axes), "
+          f"secondary at {secondary_angle:.1f}°")
 
-    print(f"  Dominant axis: {dominant_angle}° "
-          f"({pct:.0f}% of wall length), "
-          f"secondary {'found' if has_secondary else 'weak'} at {secondary_angle}°")
-
-    # --- Define the 4 cardinal directions ---
-    # Angles in [0, 180) for the 4 axes (each direction and its reverse
-    # map to the same [0,180) angle, so we only need 2 unique values)
-    axis_angles = [dominant_angle % 180, (dominant_angle + 90) % 180]
-
-    # --- Snap each segment ---
+    # ------------------------------------------------------------------
+    # Pass 2: Angle snapping — rotate segments to exact axis angles
+    # ------------------------------------------------------------------
     snapped = []
     n_snapped = 0
 
-    for i, ((x1, y1), (x2, y2)) in enumerate(segments):
-        seg_angle = angles[i]
-        seg_len = lengths[i]
+    for seg_angle, seg_len, mid_x, mid_y, (x1, y1), (x2, y2) in seg_data:
         is_long = seg_len >= long_threshold
         tol = snap_tol_long if is_long else snap_tol_short
 
-        # Find nearest axis angle
+        # Find nearest axis
         best_axis = None
         best_diff = 999.0
         for ax in axis_angles:
-            diff = abs(seg_angle - ax)
-            if diff > 90:
-                diff = 180 - diff
+            diff = _angle_distance(seg_angle, ax)
             if diff < best_diff:
                 best_diff = diff
                 best_axis = ax
 
         if best_diff <= tol:
-            # Snap: rotate segment around midpoint to exact axis angle
-            mid_x = (x1 + x2) / 2.0
-            mid_y = (y1 + y2) / 2.0
             half_len = seg_len / 2.0
-
-            # Determine which direction along the axis to use
-            # (preserve the original direction sense)
+            # Preserve direction sense
             orig_rad = np.radians(seg_angle)
             ax_rad = np.radians(best_axis)
-            # Check if we need the 180-flipped version
-            dot = np.cos(orig_rad) * np.cos(ax_rad) + np.sin(orig_rad) * np.sin(ax_rad)
+            dot = (np.cos(orig_rad) * np.cos(ax_rad) +
+                   np.sin(orig_rad) * np.sin(ax_rad))
             if dot < 0:
                 ax_rad += np.pi
 
@@ -533,12 +568,116 @@ def _snap_to_orthogonal(segments, resolution, long_threshold=1.0,
             ))
             n_snapped += 1
         else:
-            # Keep as-is
             snapped.append(((x1, y1), (x2, y2)))
 
     print(f"  Snapped {n_snapped}/{len(segments)} segments to "
-          f"{dominant_angle}°/{secondary_angle}° axes")
+          f"{dominant_angle:.1f}°/{secondary_angle:.1f}° axes")
+
+    # ------------------------------------------------------------------
+    # Pass 3: Endpoint alignment — merge nearby endpoints so corners meet
+    # ------------------------------------------------------------------
+    snapped = _align_endpoints(snapped, snap_radius=resolution * 5)
+
     return snapped
+
+
+def _angle_distance(a, b):
+    """Shortest angular distance in [0,180) space. Works on scalars or arrays."""
+    d = np.abs(np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64))
+    d = np.where(d > 90, 180 - d, d)
+    return d
+
+
+def _align_endpoints(segments, snap_radius=0.10):
+    """Snap nearby endpoints to a common location so walls meet cleanly.
+
+    Groups all segment endpoints that are within snap_radius of each other,
+    replaces each group with the length-weighted centroid, then projects
+    endpoints of axis-aligned segments onto a common grid line so parallel
+    walls share exact coordinates.
+
+    Args:
+        segments: List of ((x1,y1),(x2,y2)) tuples (already angle-snapped).
+        snap_radius: Maximum distance (metres) to merge endpoints.
+
+    Returns:
+        New list of segments with aligned endpoints.
+    """
+    if not segments:
+        return segments
+
+    # Collect all endpoints
+    pts = []  # (x, y, seg_idx, end_idx)
+    for i, ((x1, y1), (x2, y2)) in enumerate(segments):
+        pts.append((x1, y1, i, 0))
+        pts.append((x2, y2, i, 1))
+
+    n_pts = len(pts)
+    coords = np.array([(p[0], p[1]) for p in pts])
+
+    # --- Greedy clustering of nearby endpoints ---
+    # For each point, find all neighbours within snap_radius.
+    # Use a simple O(n²) approach — fine for typical counts (<10k segments).
+    assigned = np.full(n_pts, -1, dtype=int)
+    clusters = []  # list of lists of point indices
+
+    for i in range(n_pts):
+        if assigned[i] >= 0:
+            continue
+        # Find all unassigned points within radius
+        dists = np.sqrt((coords[:, 0] - coords[i, 0])**2 +
+                        (coords[:, 1] - coords[i, 1])**2)
+        mask = (dists <= snap_radius) & (assigned < 0)
+        members = np.where(mask)[0].tolist()
+
+        cluster_id = len(clusters)
+        clusters.append(members)
+        for m in members:
+            assigned[m] = cluster_id
+
+    # --- Compute cluster centroids (length-weighted) ---
+    seg_lengths = np.array([
+        np.sqrt((x2-x1)**2 + (y2-y1)**2)
+        for (x1, y1), (x2, y2) in segments
+    ])
+    new_coords = coords.copy()
+
+    n_merged = 0
+    for cluster in clusters:
+        if len(cluster) <= 1:
+            continue
+        # Weighted average — longer walls get more influence
+        weights = np.array([seg_lengths[pts[j][2]] for j in cluster])
+        total_w = weights.sum()
+        if total_w < 1e-12:
+            total_w = 1.0
+        cx = sum(coords[j, 0] * weights[k] for k, j in enumerate(cluster)) / total_w
+        cy = sum(coords[j, 1] * weights[k] for k, j in enumerate(cluster)) / total_w
+        for j in cluster:
+            new_coords[j] = (cx, cy)
+        n_merged += len(cluster)
+
+    if n_merged > 0:
+        print(f"  Aligned {n_merged} endpoints in {len([c for c in clusters if len(c)>1])} groups")
+
+    # Rebuild segments
+    result = []
+    seg_pts = {}  # seg_idx -> {0: (x,y), 1: (x,y)}
+    for i in range(n_pts):
+        seg_idx = pts[i][2]
+        end_idx = pts[i][3]
+        if seg_idx not in seg_pts:
+            seg_pts[seg_idx] = {}
+        seg_pts[seg_idx][end_idx] = (new_coords[i, 0], new_coords[i, 1])
+
+    for i in range(len(segments)):
+        p1 = seg_pts[i][0]
+        p2 = seg_pts[i][1]
+        # Skip degenerate segments (endpoints merged to same point)
+        if np.sqrt((p2[0]-p1[0])**2 + (p2[1]-p1[1])**2) > 0.01:
+            result.append((p1, p2))
+
+    return result
 
 
 def _skeletonize_proper(binary):
@@ -728,11 +867,38 @@ def _rdp_simplify(points, tolerance):
 # 5. DXF export
 # ---------------------------------------------------------------------------
 
+def _offset_segment(x1, y1, x2, y2, half_t):
+    """Compute the two parallel offset lines for a wall segment.
+
+    Given a centreline from (x1,y1) to (x2,y2) and half-thickness,
+    returns two pairs of endpoints — one for each wall face.
+
+    Returns:
+        ((lx1,ly1,lx2,ly2), (rx1,ry1,rx2,ry2))  — left and right faces.
+    """
+    dx, dy = x2 - x1, y2 - y1
+    length = np.sqrt(dx*dx + dy*dy)
+    if length < 1e-12:
+        return None
+    # Normal vector (perpendicular to segment direction)
+    nx = -dy / length * half_t
+    ny = dx / length * half_t
+    return (
+        (x1 + nx, y1 + ny, x2 + nx, y2 + ny),  # left face
+        (x1 - nx, y1 - ny, x2 - nx, y2 - ny),  # right face
+    )
+
+
 def export_dxf(segments, out_path, origin_offset=True):
-    """Export wall line segments to a DXF file.
+    """Export wall segments as double-line walls to a DXF file.
+
+    Each wall segment is drawn as two parallel lines (both faces of the
+    wall) with end caps at terminations. A centreline layer is also
+    included for reference.
 
     Args:
-        segments: List of ((x1,y1), (x2,y2)) in world coordinates (metres).
+        segments: List of ((x1,y1), (x2,y2), thickness) tuples in world
+            coordinates (metres). thickness is the wall width.
         out_path: Output DXF file path.
         origin_offset: If True, shift geometry so bottom-left is near origin.
     """
@@ -740,10 +906,16 @@ def export_dxf(segments, out_path, origin_offset=True):
     from ezdxf import units
 
     doc = ezdxf.new("R2010")
-    doc.units = units.M  # metres, matching the point cloud
+    doc.units = units.M
 
-    doc.layers.add("WALLS", color=7)  # White/black
-    doc.layers.add("DIMENSIONS", color=6)  # Magenta
+    doc.layers.add("WALLS", color=7)         # Wall faces (white/black)
+    doc.layers.add("WALL_CAPS", color=7)     # End caps (same colour)
+    doc.layers.add("CENTRELINE", color=8)    # Centreline (dark grey)
+    doc.layers.add("DIMENSIONS", color=6)    # Magenta
+
+    # Make centreline layer non-printing and initially off
+    cl_layer = doc.layers.get("CENTRELINE")
+    cl_layer.off()
 
     msp = doc.modelspace()
 
@@ -752,19 +924,76 @@ def export_dxf(segments, out_path, origin_offset=True):
         doc.saveas(out_path)
         return
 
-    # Optionally shift to near-origin
-    all_pts = np.array([(p[0], p[1]) for seg in segments for p in seg])
+    # Extract point coords (first two elements of each tuple)
+    all_pts = np.array([(p[0], p[1])
+                        for seg in segments
+                        for p in (seg[0], seg[1])])
     if origin_offset:
-        shift = all_pts.min(axis=0) - 1.0  # 1m margin
+        shift = all_pts.min(axis=0) - 1.0
     else:
         shift = np.zeros(2)
 
-    for (x1, y1), (x2, y2) in segments:
-        msp.add_line(
-            (x1 - shift[0], y1 - shift[1]),
-            (x2 - shift[0], y2 - shift[1]),
-            dxfattribs={"layer": "WALLS"},
-        )
+    # Collect all offset endpoints for endpoint-proximity checking
+    # (to decide where to draw end caps vs. leave open for connections)
+    all_endpoints = []
+    seg_offsets = []
+
+    for seg in segments:
+        (x1, y1), (x2, y2) = seg[0], seg[1]
+        thickness = seg[2] if len(seg) > 2 else 0.15  # fallback 15cm
+        half_t = thickness / 2.0
+
+        x1s, y1s = x1 - shift[0], y1 - shift[1]
+        x2s, y2s = x2 - shift[0], y2 - shift[1]
+
+        result = _offset_segment(x1s, y1s, x2s, y2s, half_t)
+        if result is None:
+            continue
+
+        left, right = result
+        seg_offsets.append((left, right, (x1s, y1s), (x2s, y2s), thickness))
+        all_endpoints.append((x1s, y1s))
+        all_endpoints.append((x2s, y2s))
+
+    all_ep = np.array(all_endpoints) if all_endpoints else np.empty((0, 2))
+
+    for left, right, (x1s, y1s), (x2s, y2s), thickness in seg_offsets:
+        lx1, ly1, lx2, ly2 = left
+        rx1, ry1, rx2, ry2 = right
+
+        # Draw the two wall faces
+        msp.add_line((lx1, ly1), (lx2, ly2),
+                     dxfattribs={"layer": "WALLS"})
+        msp.add_line((rx1, ry1), (rx2, ry2),
+                     dxfattribs={"layer": "WALLS"})
+
+        # Draw centreline (reference, initially hidden)
+        msp.add_line((x1s, y1s), (x2s, y2s),
+                     dxfattribs={"layer": "CENTRELINE"})
+
+        # End caps: draw a perpendicular line at each endpoint
+        # UNLESS another segment's endpoint is very close (= wall junction)
+        half_t = thickness / 2.0
+        cap_threshold = half_t * 1.5  # don't cap if another wall is nearby
+
+        for end_idx, (ex, ey) in enumerate([(x1s, y1s), (x2s, y2s)]):
+            # Count how many OTHER endpoints are within cap_threshold
+            if len(all_ep) > 0:
+                dists = np.sqrt((all_ep[:, 0] - ex)**2 +
+                                (all_ep[:, 1] - ey)**2)
+                # Exclude self (distance ~0)
+                nearby = np.sum((dists > 0.001) & (dists < cap_threshold))
+            else:
+                nearby = 0
+
+            if nearby == 0:
+                # Isolated endpoint — draw end cap
+                if end_idx == 0:
+                    msp.add_line((lx1, ly1), (rx1, ry1),
+                                 dxfattribs={"layer": "WALL_CAPS"})
+                else:
+                    msp.add_line((lx2, ly2), (rx2, ry2),
+                                 dxfattribs={"layer": "WALL_CAPS"})
 
     # Add bounding dimensions
     shifted = all_pts - shift
@@ -775,27 +1004,21 @@ def export_dxf(segments, out_path, origin_offset=True):
 
     dim_offset = max(width, height) * 0.05 + 0.5
 
-    # Create dimension style
     dim_style = doc.dimstyles.new("PLAN")
-    dim_style.dxf.dimtxt = max(width, height) * 0.015  # text height
-    dim_style.dxf.dimasz = max(width, height) * 0.01   # arrow size
+    dim_style.dxf.dimtxt = max(width, height) * 0.015
+    dim_style.dxf.dimasz = max(width, height) * 0.01
 
-    # Width dimension (bottom)
     msp.add_linear_dim(
         base=(min_x, min_y - dim_offset),
-        p1=(min_x, min_y),
-        p2=(max_x, min_y),
+        p1=(min_x, min_y), p2=(max_x, min_y),
         dimstyle="PLAN",
         dxfattribs={"layer": "DIMENSIONS"},
     ).render()
 
-    # Height dimension (left)
     msp.add_linear_dim(
         base=(min_x - dim_offset, min_y),
-        p1=(min_x, min_y),
-        p2=(min_x, max_y),
-        angle=90,
-        dimstyle="PLAN",
+        p1=(min_x, min_y), p2=(min_x, max_y),
+        angle=90, dimstyle="PLAN",
         dxfattribs={"layer": "DIMENSIONS"},
     ).render()
 
@@ -836,7 +1059,9 @@ def export_dxf_with_image(segments, image_path, image_size, resolution,
 
     # Compute the shift (same as export_dxf)
     if segments:
-        all_pts = np.array([(p[0], p[1]) for seg in segments for p in seg])
+        all_pts = np.array([(p[0], p[1])
+                            for seg in segments
+                            for p in (seg[0], seg[1])])
         if origin_offset:
             shift = all_pts.min(axis=0) - 1.0
         else:
@@ -881,13 +1106,24 @@ def export_dxf_with_image(segments, image_path, image_size, resolution,
         print(f"  WARNING: Could not embed image: {e}")
         print(f"  (Wall lines will still be exported)")
 
-    # --- Add wall segments ---
-    for (x1, y1), (x2, y2) in segments:
-        msp.add_line(
-            (x1 - shift[0], y1 - shift[1]),
-            (x2 - shift[0], y2 - shift[1]),
-            dxfattribs={"layer": "WALLS"},
-        )
+    # --- Add wall segments (double-line) ---
+    for seg in segments:
+        (x1, y1), (x2, y2) = seg[0], seg[1]
+        thickness = seg[2] if len(seg) > 2 else 0.15
+        half_t = thickness / 2.0
+
+        x1s, y1s = x1 - shift[0], y1 - shift[1]
+        x2s, y2s = x2 - shift[0], y2 - shift[1]
+
+        result = _offset_segment(x1s, y1s, x2s, y2s, half_t)
+        if result is None:
+            continue
+
+        left, right = result
+        msp.add_line((left[0], left[1]), (left[2], left[3]),
+                     dxfattribs={"layer": "WALLS"})
+        msp.add_line((right[0], right[1]), (right[2], right[3]),
+                     dxfattribs={"layer": "WALLS"})
 
     # --- Add dimensions ---
     if segments:
