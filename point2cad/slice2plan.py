@@ -1192,6 +1192,80 @@ def _build_wall_geometry(segments, shift):
                 else:
                     wb['cap_end'] = False
 
+    # --- 3b. T-junction detection ---
+    # Find endpoints that land near the MIDDLE of another wall (not at
+    # its endpoints). These are T-junctions — a wall or casing that
+    # terminates against the side of another wall.
+    for i, w in enumerate(walls):
+        for end_idx in (0, 1):
+            # Skip if already joined at this end
+            if end_idx == 0 and not w['cap_start']:
+                continue
+            if end_idx == 1 and not w['cap_end']:
+                continue
+
+            ep = w['p1'] if end_idx == 0 else w['p2']
+
+            for j, other in enumerate(walls):
+                if i == j:
+                    continue
+
+                # Project ep onto other wall's centreline
+                v = ep - other['p1']
+                d = other['dir']
+                t = np.dot(v, d)
+                seg_len = np.linalg.norm(other['p2'] - other['p1'])
+
+                # Must be within the segment span (not at the very ends)
+                if t < other['half_t'] * 0.5 or t > seg_len - other['half_t'] * 0.5:
+                    continue
+
+                # Perpendicular distance
+                proj = other['p1'] + t * d
+                perp_dist = np.linalg.norm(ep - proj)
+                max_perp = (w['half_t'] + other['half_t']) * 1.5
+
+                if perp_dist > max_perp:
+                    continue
+
+                # T-junction found! Extend wall i's faces to meet
+                # wall j's faces
+                n_other = other['normal']  # already scaled by half_t
+
+                # Wall i's left and right offset lines at this end
+                for side in ('L', 'R'):
+                    key = f'{side}{1 if end_idx == 0 else 2}'
+                    face_pt = w[key]
+
+                    # Find which face of the other wall is closer
+                    other_L_line_pt = other['p1'] + n_other
+                    other_R_line_pt = other['p1'] - n_other
+
+                    # Intersect wall i's face line with each face of other
+                    best_ix = None
+                    best_dist = 999
+                    for other_face_pt in [other_L_line_pt, other_R_line_pt]:
+                        ix = _line_intersection(
+                            face_pt, w['dir'], other_face_pt, other['dir']
+                        )
+                        if ix is None:
+                            continue
+                        ix = np.array(ix)
+                        d_ix = np.linalg.norm(ix - ep)
+                        if d_ix < best_dist and d_ix < max_perp * 3:
+                            best_dist = d_ix
+                            best_ix = ix
+
+                    if best_ix is not None:
+                        w[key] = best_ix
+
+                # Mark end as joined
+                if end_idx == 0:
+                    w['cap_start'] = False
+                else:
+                    w['cap_end'] = False
+                break  # only join to one wall per endpoint
+
     # --- 4. Build output geometry ---
     result = []
     for w in walls:
