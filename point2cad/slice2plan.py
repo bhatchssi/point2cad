@@ -246,8 +246,10 @@ def detect_walls(image, origin, resolution, min_density=3,
     polylines = _chain_skeleton(skeleton)
     print(f"  Chained into {len(polylines)} polylines")
 
-    # --- 6. Convert to world coords, simplify, emit segments ---
+    # --- 6. Convert to world coords, simplify, merge collinear ---
     min_px_len = max(3, int(min_line_length / resolution))
+    # Use a shorter minimum for small features (window casings, etc.)
+    min_short = min_line_length * 0.4
     all_segments = []
 
     for chain in polylines:
@@ -263,16 +265,84 @@ def detect_walls(image, origin, resolution, min_density=3,
         if len(simplified) < 2:
             continue
 
+        # Build raw segments from this polyline
+        raw_segs = []
         for i in range(len(simplified) - 1):
             p1, p2 = simplified[i], simplified[i + 1]
             seg_len = np.linalg.norm(p2 - p1)
-            if seg_len >= min_line_length:
+            if seg_len >= min_short:
+                raw_segs.append((p1, p2))
+
+        # Merge consecutive collinear segments into longer walls
+        merged = _merge_collinear(raw_segs, angle_tol=5.0,
+                                   gap_tol=resolution * 4)
+
+        for p1, p2 in merged:
+            seg_len = np.linalg.norm(p2 - p1)
+            if seg_len >= min_short:
                 all_segments.append(
                     ((p1[0], p1[1]), (p2[0], p2[1]))
                 )
 
     print(f"  Final: {len(all_segments)} wall segments")
     return all_segments
+
+
+def _merge_collinear(segments, angle_tol=5.0, gap_tol=0.1):
+    """Merge consecutive nearly-collinear segments into longer walls.
+
+    Walks the segment list and greedily fuses segments whose direction
+    differs by less than angle_tol degrees. This prevents straight walls
+    from being broken into many short pieces by pixel-level jitter.
+
+    Args:
+        segments: List of (p1, p2) numpy array pairs (ordered from polyline).
+        angle_tol: Maximum angle difference (degrees) to consider collinear.
+        gap_tol: Maximum gap between segment endpoints to allow merging.
+
+    Returns:
+        New list of (p1, p2) segments with collinear runs merged.
+    """
+    if len(segments) <= 1:
+        return segments
+
+    def _seg_angle(p1, p2):
+        d = p2 - p1
+        return np.degrees(np.arctan2(d[1], d[0])) % 180.0
+
+    merged = []
+    # Start accumulating from the first segment
+    cur_start = segments[0][0]
+    cur_end = segments[0][1]
+    cur_angle = _seg_angle(cur_start, cur_end)
+
+    for i in range(1, len(segments)):
+        seg_start, seg_end = segments[i]
+        seg_angle = _seg_angle(seg_start, seg_end)
+
+        # Angle difference (handle wraparound at 180)
+        angle_diff = abs(cur_angle - seg_angle)
+        if angle_diff > 90:
+            angle_diff = 180 - angle_diff
+
+        # Gap between current end and next segment start
+        gap = np.linalg.norm(seg_start - cur_end)
+
+        if angle_diff <= angle_tol and gap <= gap_tol:
+            # Extend current segment to the end of this one
+            cur_end = seg_end
+            # Update running angle using the full merged span
+            cur_angle = _seg_angle(cur_start, cur_end)
+        else:
+            # Emit current merged segment, start a new one
+            merged.append((cur_start, cur_end))
+            cur_start = seg_start
+            cur_end = seg_end
+            cur_angle = seg_angle
+
+    # Emit the last segment
+    merged.append((cur_start, cur_end))
+    return merged
 
 
 def _skeletonize_proper(binary):
