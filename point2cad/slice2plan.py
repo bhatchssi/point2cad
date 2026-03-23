@@ -252,14 +252,14 @@ def detect_walls(image, origin, resolution, min_density=3,
         stretched = image.copy()
 
     # --- 2. Threshold ---
-    # Walls are the brightest features (dense scan hits). Furniture,
-    # scanner glow, and other interior objects are dimmer.
-    # Use Otsu's method on the non-zero stretched pixels to find the
-    # natural wall/non-wall boundary, then take the higher of Otsu vs
-    # a minimum floor to avoid picking up furniture.
+    # Use Otsu's method on non-zero pixels to separate wall signal from
+    # background noise. Don't force the threshold too high — scanner
+    # orthoimages have walls at varying brightness depending on scan
+    # density and angle. A too-high threshold shatters walls into pieces.
     threshold = _otsu_threshold(stretched)
-    # Enforce a reasonable minimum — never go below 40% of the range
-    threshold = max(threshold, 100, min_density)
+    # Only enforce a modest floor — the contrast stretch already
+    # normalised the range, so Otsu on non-zero pixels is reliable.
+    threshold = max(threshold, min_density, 30)
     print(f"  Threshold: {threshold} (walls must be >= this brightness)")
     binary = (stretched >= threshold).astype(np.uint8)
     n_wall_px = binary.sum()
@@ -270,12 +270,19 @@ def detect_walls(image, origin, resolution, min_density=3,
         print("  WARNING: No wall pixels found. Try lowering --min_density.")
         return []
 
-    # --- 3. Light cleanup ---
+    # --- 3. Morphological cleanup ---
     struct8 = ndimage.generate_binary_structure(2, 2)  # 8-connected
     struct4 = ndimage.generate_binary_structure(2, 1)  # 4-connected
 
-    # Close tiny 1px gaps in wall lines (but don't over-thicken)
+    # Close gaps in wall lines — use 8-connected structuring element and
+    # 2 iterations to bridge gaps up to ~2px (caused by threshold cutting
+    # through thin or dim wall sections).
     binary = ndimage.binary_closing(
+        binary, structure=struct8, iterations=2
+    ).astype(np.uint8)
+
+    # Gentle dilation to reconnect wall fragments that are 1px apart
+    binary = ndimage.binary_dilation(
         binary, structure=struct4, iterations=1
     ).astype(np.uint8)
 
@@ -283,7 +290,7 @@ def detect_walls(image, origin, resolution, min_density=3,
     labeled_noise, n_noise = ndimage.label(binary, structure=struct8)
     if n_noise > 0:
         sizes = ndimage.sum(binary, labeled_noise, range(1, n_noise + 1))
-        min_blob = max(5, int(0.1 / resolution))  # 10cm minimum blob
+        min_blob = max(10, int(0.15 / resolution))  # 15cm minimum blob
         for i, sz in enumerate(sizes):
             if sz < min_blob:
                 binary[labeled_noise == (i + 1)] = 0
@@ -352,8 +359,9 @@ def detect_walls(image, origin, resolution, min_density=3,
                 raw_segs.append((p1, p2))
 
         # Merge consecutive collinear segments into longer walls
-        merged = _merge_collinear(raw_segs, angle_tol=5.0,
-                                   gap_tol=resolution * 4)
+        # Use generous tolerances to prevent walls from being fragmented
+        merged = _merge_collinear(raw_segs, angle_tol=8.0,
+                                   gap_tol=resolution * 8)
 
         for p1, p2 in merged:
             seg_len = np.linalg.norm(p2 - p1)
@@ -384,6 +392,11 @@ def detect_walls(image, origin, resolution, min_density=3,
     all_segments = [(p1, p2, max(min_t, min(t, max_t)))
                     for p1, p2, t in all_segments]
 
+    # --- 9. Global collinear merge ---
+    # After snapping, segments from different polyline chains that ended
+    # up on the same axis-aligned line should be merged into longer walls.
+    all_segments = _merge_global_collinear(all_segments, resolution)
+
     # Report typical wall thickness
     if all_segments:
         ts = [s[2] for s in all_segments]
@@ -392,6 +405,130 @@ def detect_walls(image, origin, resolution, min_density=3,
 
     print(f"  Final: {len(all_segments)} wall segments")
     return all_segments
+
+
+def _merge_global_collinear(segments, resolution, angle_tol=3.0,
+                             lateral_tol=None, gap_tol=None):
+    """Merge collinear segments across different polyline chains.
+
+    After orthogonal snapping, many segments from separate chains may lie
+    on the same line. This groups segments by direction and lateral offset,
+    then merges overlapping/nearby segments within each group.
+
+    Args:
+        segments: List of ((x1,y1),(x2,y2), thickness) tuples.
+        resolution: Grid resolution (metres).
+        angle_tol: Max angle difference to consider same direction (degrees).
+        lateral_tol: Max perpendicular distance to consider same line (metres).
+            Default: 3 * resolution.
+        gap_tol: Max gap along the line to bridge when merging (metres).
+            Default: 10 * resolution.
+
+    Returns:
+        New list of merged ((x1,y1),(x2,y2), thickness) tuples.
+    """
+    if len(segments) < 2:
+        return segments
+
+    if lateral_tol is None:
+        lateral_tol = resolution * 3
+    if gap_tol is None:
+        gap_tol = resolution * 10
+
+    # Group segments by angle (quantised to nearest axis)
+    # For each segment, compute angle in [0, 180) and a lateral offset
+    # (signed distance from origin along the perpendicular direction).
+    entries = []  # (angle, lateral, t_min, t_max, thickness, index)
+    for i, seg in enumerate(segments):
+        (x1, y1), (x2, y2) = seg[0], seg[1]
+        thickness = seg[2]
+        dx, dy = x2 - x1, y2 - y1
+        angle = np.degrees(np.arctan2(dy, dx)) % 180.0
+        length = np.sqrt(dx*dx + dy*dy)
+        if length < 1e-12:
+            continue
+
+        # Unit direction and perpendicular
+        ux, uy = dx / length, dy / length
+        # Lateral offset = perpendicular distance from origin
+        # For a line through (x1,y1) with direction (ux,uy),
+        # lateral = x1 * (-uy) + y1 * ux
+        lateral = x1 * (-uy) + y1 * ux
+
+        # Project endpoints along the line direction
+        t1 = x1 * ux + y1 * uy
+        t2 = x2 * ux + y2 * uy
+        t_min, t_max = min(t1, t2), max(t1, t2)
+
+        entries.append((angle, lateral, t_min, t_max, thickness, ux, uy))
+
+    if not entries:
+        return segments
+
+    # Sort by angle, then lateral offset
+    entries.sort(key=lambda e: (round(e[0] / angle_tol) * angle_tol, e[1]))
+
+    # Greedy merge: walk through sorted entries, merge compatible ones
+    merged = []
+    used = [False] * len(entries)
+
+    for i in range(len(entries)):
+        if used[i]:
+            continue
+        a_i, lat_i, tmin_i, tmax_i, thick_i, ux_i, uy_i = entries[i]
+        used[i] = True
+
+        # Find all compatible segments
+        for j in range(i + 1, len(entries)):
+            if used[j]:
+                continue
+            a_j, lat_j, tmin_j, tmax_j, thick_j, ux_j, uy_j = entries[j]
+
+            # Check angle compatibility
+            if _angle_distance(a_i, a_j) > angle_tol:
+                # Since sorted by angle, no more matches in this group
+                # (but there could be wraparound, so don't break)
+                continue
+
+            # Check lateral offset (are they on the same line?)
+            if abs(lat_i - lat_j) > lateral_tol:
+                continue
+
+            # Check gap along the line
+            gap = max(0, max(tmin_j - tmax_i, tmin_i - tmax_j))
+            if gap > gap_tol:
+                continue
+
+            # Merge: extend the span
+            tmin_i = min(tmin_i, tmin_j)
+            tmax_i = max(tmax_i, tmax_j)
+            thick_i = max(thick_i, thick_j)  # use thicker measurement
+            used[j] = True
+
+        # Reconstruct segment from merged span
+        x1 = ux_i * tmin_i - (-uy_i) * lat_i
+        y1 = uy_i * tmin_i - ux_i * (-lat_i)
+        # Simpler: use parametric form
+        # Point on line = t * (ux, uy) + lateral * (-uy, ux) ... wait
+        # lateral = x*(-uy) + y*ux, so the line is:
+        # x = t*ux + lateral*(-uy) ... no. Let me think.
+        # Actually: given lateral = -uy*x + ux*y, and t = ux*x + uy*y
+        # Then: x = ux*t - uy*lateral, y = uy*t + ux*lateral
+        # (inverse of the rotation)
+        p1x = ux_i * tmin_i - uy_i * lat_i
+        p1y = uy_i * tmin_i + ux_i * lat_i
+        p2x = ux_i * tmax_i - uy_i * lat_i
+        p2y = uy_i * tmax_i + ux_i * lat_i
+
+        merged.append(((p1x, p1y), (p2x, p2y), thick_i))
+
+    n_before = len(segments)
+    n_after = len(merged)
+    if n_before > n_after:
+        print(f"  Global merge: {n_before} -> {n_after} segments "
+              f"({n_before - n_after} merged)")
+
+    return merged
 
 
 def _merge_collinear(segments, angle_tol=5.0, gap_tol=0.1):
