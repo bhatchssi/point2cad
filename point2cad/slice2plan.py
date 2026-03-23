@@ -482,6 +482,74 @@ def load_image(path):
     )
 
 
+def read_worldfile(image_path):
+    """Try to read a sidecar worldfile (.pgw, .tfw, .jgw, .wld) for an image.
+
+    Worldfiles are 6-line text files used in GIS to georeference raster images.
+    Lines: [x_scale, rotation_y, rotation_x, y_scale, x_origin, y_origin].
+
+    For floor plans we only care about the pixel size (x_scale) and the origin.
+
+    Args:
+        image_path: Path to the image file.
+
+    Returns:
+        (resolution, origin) tuple if a worldfile is found, or None.
+        resolution is in the worldfile's units (typically metres).
+        origin is (x_min, y_min).
+    """
+    base, ext = os.path.splitext(image_path)
+
+    # Common worldfile extension patterns
+    # .png -> .pgw, .jpg -> .jgw, .tif -> .tfw, or generic .wld
+    wf_candidates = []
+    if len(ext) >= 4:
+        # "First + last + w" convention: .png -> .pgw, .tif -> .tfw
+        wf_ext = ext[0:2] + ext[-1] + "w"
+        wf_candidates.append(base + wf_ext)
+        wf_candidates.append(base + wf_ext.upper())
+    wf_candidates.append(base + ".wld")
+    wf_candidates.append(base + ".WLD")
+    # Also try appending "w" directly: .png -> .pngw
+    wf_candidates.append(image_path + "w")
+    wf_candidates.append(image_path + "W")
+
+    for wf_path in wf_candidates:
+        if not os.path.isfile(wf_path):
+            continue
+        try:
+            with open(wf_path, "r") as f:
+                lines = [line.strip() for line in f.readlines() if line.strip()]
+            if len(lines) < 6:
+                continue
+
+            x_scale = float(lines[0])    # pixel width (metres/pixel)
+            rot_y = float(lines[1])       # rotation (usually 0)
+            rot_x = float(lines[2])       # rotation (usually 0)
+            y_scale = float(lines[3])     # pixel height (negative = top-down)
+            x_origin = float(lines[4])    # X of centre of top-left pixel
+            y_origin = float(lines[5])    # Y of centre of top-left pixel
+
+            resolution = abs(x_scale)
+            # Origin is the top-left pixel centre; shift to corner
+            origin_x = x_origin - resolution / 2.0
+            origin_y = y_origin - abs(y_scale) / 2.0 if y_scale > 0 else y_origin + y_scale / 2.0
+
+            print(f"  Found worldfile: {wf_path}")
+            print(f"    Pixel size: {resolution}m, "
+                  f"Origin: ({origin_x:.2f}, {origin_y:.2f})")
+
+            if abs(rot_y) > 1e-6 or abs(rot_x) > 1e-6:
+                print(f"    WARNING: Worldfile has rotation ({rot_y}, {rot_x}) "
+                      f"which is ignored — assuming axis-aligned image.")
+
+            return resolution, (origin_x, origin_y)
+        except (ValueError, IndexError):
+            continue
+
+    return None
+
+
 def _read_pgm(path):
     """Read a binary PGM (P5) file without Pillow."""
     with open(path, "rb") as f:
@@ -604,15 +672,23 @@ def run_pipeline_from_image(image_path, output_dxf=None, resolution=0.02,
     print(f"Reading image: {image_path}")
     image = load_image(image_path)
     print(f"  Image size: {image.shape[1]} x {image.shape[0]} pixels")
-    print(f"  Resolution: {resolution} m/px "
-          f"=> {image.shape[1]*resolution:.1f}m x {image.shape[0]*resolution:.1f}m")
 
     if invert:
         image = 255 - image
         print("  Inverted image (dark walls -> bright)")
 
-    # Origin at (0, 0) — bottom-left of the image in world coords
-    origin = (0.0, 0.0)
+    # Try worldfile for georeferencing; fall back to CLI --resolution
+    wf = read_worldfile(image_path)
+    if wf is not None:
+        resolution, origin = wf
+        print(f"  Using worldfile: {resolution} m/px, "
+              f"origin=({origin[0]:.2f}, {origin[1]:.2f})")
+    else:
+        origin = (0.0, 0.0)
+        print(f"  No worldfile found, using --resolution={resolution} m/px")
+
+    print(f"  Real-world extents: "
+          f"{image.shape[1]*resolution:.1f}m x {image.shape[0]*resolution:.1f}m")
 
     print("  Detecting walls...")
     segments = detect_walls(image, origin, resolution, min_density=min_density)
