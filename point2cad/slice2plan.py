@@ -143,35 +143,33 @@ def rasterize(points_2d, resolution=0.02):
 
 
 # ---------------------------------------------------------------------------
-# 4. Wall detection — contour tracing + polyline simplification
+# 4. Wall detection — pixel chaining + polyline simplification
+#
+# Tuned for GeoSLAM/FARO scanner orthoimages where walls appear as thin
+# bright lines (1-3px) on a black background. The key insight is that
+# walls are already thin — no morphological closing/dilation needed (that
+# would merge parallel walls). Instead we:
+#   1. Contrast-stretch the very faint wall pixels
+#   2. Threshold to binary
+#   3. Light cleanup (close 1px gaps, remove isolated noise)
+#   4. Skeletonize to guaranteed 1px-wide centrelines
+#   5. Chain skeleton pixels into ordered polylines
+#   6. Simplify each polyline (RDP) into clean wall segments
 # ---------------------------------------------------------------------------
 
 def detect_walls(image, origin, resolution, min_density=3,
-                 morph_iterations=3, min_line_length=0.3,
-                 simplify_tolerance=None):
-    """Detect wall segments from the density image.
-
-    Strategy:
-      1. Threshold the density image to binary.
-      2. Morphological closing + dilation to connect nearby wall pixels and
-         fill scanner gaps.
-      3. Trace the boundary contours of every connected wall region.
-      4. Simplify each contour polyline (Ramer-Douglas-Peucker) to get
-         clean wall segments.
-
-    This produces many more segments than the old skeleton+PCA approach
-    because it follows the actual wall outlines.
+                 min_line_length=0.3, simplify_tolerance=None,
+                 morph_iterations=None):
+    """Detect wall segments from a scanner orthoimage.
 
     Args:
-        image: 2D uint8 density image from rasterize().
+        image: 2D uint8 density image (bright = walls, dark = empty).
         origin: (x_min, y_min) world coordinate origin.
         resolution: Grid cell size in metres.
-        min_density: Minimum pixel value to consider as "wall" (lowered
-            from 5 to 3 to capture thinner walls).
-        morph_iterations: Iterations of morphological closing.
+        min_density: Minimum pixel value to consider as wall.
         min_line_length: Minimum wall segment length in metres.
-        simplify_tolerance: Tolerance for polyline simplification in metres.
-            Default: 2 * resolution (keeps detail while removing noise).
+        simplify_tolerance: RDP tolerance in metres (default: 3*resolution).
+        morph_iterations: Unused, kept for CLI compatibility.
 
     Returns:
         List of ((x1, y1), (x2, y2)) line segments in world coordinates.
@@ -179,10 +177,34 @@ def detect_walls(image, origin, resolution, min_density=3,
     from scipy import ndimage
 
     if simplify_tolerance is None:
-        simplify_tolerance = resolution * 2.0
+        simplify_tolerance = resolution * 3.0
 
-    # --- Threshold ---
-    binary = (image >= min_density).astype(np.uint8)
+    # --- 1. Contrast stretch ---
+    # Scanner orthoimages have very faint walls (pixel values 2-40).
+    # Stretch the non-zero range to 0-255 so thresholding works well.
+    nonzero = image[image > 0]
+    if len(nonzero) == 0:
+        print("  WARNING: Image is completely black.")
+        return []
+
+    p_low = np.percentile(nonzero, 5)
+    p_high = np.percentile(nonzero, 99)
+    print(f"  Pixel stats: non-zero range [{nonzero.min()}-{nonzero.max()}], "
+          f"p5={p_low:.0f}, p99={p_high:.0f}")
+
+    if p_high > p_low:
+        stretched = np.clip(
+            (image.astype(np.float32) - p_low) / (p_high - p_low) * 255,
+            0, 255
+        ).astype(np.uint8)
+    else:
+        stretched = image.copy()
+
+    # --- 2. Threshold ---
+    # After stretching, walls should be bright. Use a moderate threshold
+    # to separate walls from the diffuse scanner glow.
+    threshold = max(min_density, 30)  # post-stretch threshold
+    binary = (stretched >= threshold).astype(np.uint8)
     n_wall_px = binary.sum()
     print(f"  Binary mask: {n_wall_px:,} wall pixels "
           f"({100*n_wall_px/binary.size:.1f}% of image)")
@@ -191,50 +213,56 @@ def detect_walls(image, origin, resolution, min_density=3,
         print("  WARNING: No wall pixels found. Try lowering --min_density.")
         return []
 
-    # --- Morphological cleanup ---
-    struct = ndimage.generate_binary_structure(2, 2)  # 8-connected
-    # Close gaps between nearby wall points
+    # --- 3. Light cleanup ---
+    struct8 = ndimage.generate_binary_structure(2, 2)  # 8-connected
+    struct4 = ndimage.generate_binary_structure(2, 1)  # 4-connected
+
+    # Close tiny 1px gaps in wall lines (but don't over-thicken)
     binary = ndimage.binary_closing(
-        binary, structure=struct, iterations=morph_iterations
-    ).astype(np.uint8)
-    # Slight dilation to merge thin parallel scan lines
-    binary = ndimage.binary_dilation(
-        binary, structure=struct, iterations=1
+        binary, structure=struct4, iterations=1
     ).astype(np.uint8)
 
-    # --- Label connected components ---
-    labeled, n_features = ndimage.label(binary, structure=struct)
-    sizes = ndimage.sum(binary, labeled, range(1, n_features + 1))
-    min_pixels = max(3, int(min_line_length / resolution))
-    print(f"  {n_features} connected regions "
-          f"(keeping regions >= {min_pixels} px)")
+    # Remove small isolated noise blobs
+    labeled_noise, n_noise = ndimage.label(binary, structure=struct8)
+    if n_noise > 0:
+        sizes = ndimage.sum(binary, labeled_noise, range(1, n_noise + 1))
+        min_blob = max(5, int(0.1 / resolution))  # 10cm minimum blob
+        for i, sz in enumerate(sizes):
+            if sz < min_blob:
+                binary[labeled_noise == (i + 1)] = 0
+        n_removed = sum(1 for s in sizes if s < min_blob)
+        if n_removed > 0:
+            print(f"  Removed {n_removed} noise blobs (< {min_blob}px)")
 
-    # --- Trace contours of each region ---
+    # --- 4. Skeletonize to 1px centrelines ---
+    skeleton = _skeletonize_proper(binary)
+    n_skel = skeleton.sum()
+    print(f"  Skeleton: {n_skel:,} pixels")
+
+    if n_skel == 0:
+        return []
+
+    # --- 5. Chain skeleton pixels into polylines ---
+    polylines = _chain_skeleton(skeleton)
+    print(f"  Chained into {len(polylines)} polylines")
+
+    # --- 6. Convert to world coords, simplify, emit segments ---
+    min_px_len = max(3, int(min_line_length / resolution))
     all_segments = []
-    regions_used = 0
 
-    for label_id in range(1, n_features + 1):
-        if sizes[label_id - 1] < min_pixels:
-            continue
-        regions_used += 1
-
-        region_mask = (labeled == label_id).astype(np.uint8)
-        contour_points = _trace_contour(region_mask)
-
-        if len(contour_points) < 2:
+    for chain in polylines:
+        if len(chain) < min_px_len:
             continue
 
-        # Convert pixel coords (row, col) to world coords (x, y)
-        world_pts = np.empty_like(contour_points, dtype=np.float64)
-        world_pts[:, 0] = contour_points[:, 1] * resolution + origin[0]
-        world_pts[:, 1] = contour_points[:, 0] * resolution + origin[1]
+        # Convert (row, col) to world (x, y)
+        world_pts = np.empty((len(chain), 2), dtype=np.float64)
+        world_pts[:, 0] = chain[:, 1] * resolution + origin[0]  # col -> x
+        world_pts[:, 1] = chain[:, 0] * resolution + origin[1]  # row -> y
 
-        # Simplify polyline
         simplified = _rdp_simplify(world_pts, simplify_tolerance)
         if len(simplified) < 2:
             continue
 
-        # Convert polyline vertices to line segments
         for i in range(len(simplified) - 1):
             p1, p2 = simplified[i], simplified[i + 1]
             seg_len = np.linalg.norm(p2 - p1)
@@ -243,66 +271,152 @@ def detect_walls(image, origin, resolution, min_density=3,
                     ((p1[0], p1[1]), (p2[0], p2[1]))
                 )
 
-    print(f"  Traced {len(all_segments)} wall segments "
-          f"from {regions_used} regions")
+    print(f"  Final: {len(all_segments)} wall segments")
     return all_segments
 
 
-def _trace_contour(mask):
-    """Trace the outer boundary of a binary region.
+def _skeletonize_proper(binary):
+    """Zhang-Suen thinning to produce clean 1px-wide skeletons.
 
-    Uses a simple Moore-neighbourhood boundary tracing algorithm.
-    Returns an Nx2 array of (row, col) pixel coordinates forming the contour.
+    Unlike simple erosion-based skeletonization, this preserves connectivity
+    and produces clean centrelines suitable for chaining.
     """
-    # Pad the mask so boundary pixels on the image edge are handled
-    padded = np.pad(mask, 1, mode='constant', constant_values=0)
+    img = binary.astype(np.uint8).copy()
+    rows, cols = img.shape
+    changed = True
 
-    # Find a starting pixel (first nonzero in raster order)
-    rows, cols = np.where(padded > 0)
-    if len(rows) == 0:
-        return np.empty((0, 2), dtype=np.float64)
+    while changed:
+        changed = False
+        for step in (0, 1):
+            # Pad for safe neighbour access
+            padded = np.pad(img, 1, mode='constant', constant_values=0)
+            markers = np.zeros_like(img, dtype=bool)
 
-    start_r, start_c = rows[0], cols[0]
+            # Get all foreground pixels
+            ys, xs = np.where(img == 1)
 
-    # 8-connected neighbour offsets (clockwise from top-left)
-    #  5 6 7
-    #  4 . 0
-    #  3 2 1
-    dr = [0, 1, 1,  1,  0, -1, -1, -1]
-    dc = [1, 1, 0, -1, -1, -1,  0,  1]
+            for idx in range(len(ys)):
+                r, c = ys[idx], xs[idx]
+                rp, cp = r + 1, c + 1  # padded coords
 
-    contour = [(start_r, start_c)]
-    r, c = start_r, start_c
-    # Enter from the left (direction 4)
-    backtrack_dir = 4
-    max_steps = padded.size  # safety limit
+                # 8-neighbours (P2..P9 in Zhang-Suen convention)
+                p2 = padded[rp - 1, cp]
+                p3 = padded[rp - 1, cp + 1]
+                p4 = padded[rp, cp + 1]
+                p5 = padded[rp + 1, cp + 1]
+                p6 = padded[rp + 1, cp]
+                p7 = padded[rp + 1, cp - 1]
+                p8 = padded[rp, cp - 1]
+                p9 = padded[rp - 1, cp - 1]
 
-    for _ in range(max_steps):
-        # Search clockwise starting from (backtrack_dir + 1) % 8
-        found = False
-        start_search = (backtrack_dir + 1) % 8
-        for k in range(8):
-            d = (start_search + k) % 8
-            nr, nc = r + dr[d], c + dc[d]
-            if padded[nr, nc]:
-                r, c = nr, nc
-                # Backtrack direction = opposite of the direction we came from
-                backtrack_dir = (d + 4) % 8
-                found = True
+                neighbours = [p2, p3, p4, p5, p6, p7, p8, p9]
+                B = sum(neighbours)  # number of non-zero neighbours
+
+                if B < 2 or B > 6:
+                    continue
+
+                # Count 0->1 transitions in the ordered sequence
+                A = 0
+                seq = neighbours + [neighbours[0]]
+                for k in range(8):
+                    if seq[k] == 0 and seq[k + 1] == 1:
+                        A += 1
+
+                if A != 1:
+                    continue
+
+                if step == 0:
+                    if p2 * p4 * p6 != 0:
+                        continue
+                    if p4 * p6 * p8 != 0:
+                        continue
+                else:
+                    if p2 * p4 * p8 != 0:
+                        continue
+                    if p2 * p6 * p8 != 0:
+                        continue
+
+                markers[r, c] = True
+
+            if markers.any():
+                img[markers] = 0
+                changed = True
+
+    return img
+
+
+def _chain_skeleton(skeleton):
+    """Chain skeleton pixels into ordered polylines.
+
+    Walks along connected skeleton pixels, starting from endpoints
+    (pixels with only 1 neighbour) or junction pixels. Produces a list
+    of Nx2 arrays of (row, col) coordinates.
+    """
+    skel = skeleton.astype(np.uint8).copy()
+    rows, cols = skel.shape
+
+    # Precompute neighbour count for each pixel
+    from scipy import ndimage
+    struct8 = ndimage.generate_binary_structure(2, 2)
+    neighbour_count = ndimage.convolve(
+        skel.astype(np.int32), struct8.astype(np.int32), mode='constant'
+    ) - skel.astype(np.int32)  # subtract self
+
+    # 8-neighbour offsets
+    dr = [-1, -1, -1, 0, 0, 1, 1, 1]
+    dc = [-1, 0, 1, -1, 1, -1, 0, 1]
+
+    # Find endpoints (1 neighbour) — best starting points for chains
+    endpoints = set()
+    junctions = set()
+    ys, xs = np.where(skel > 0)
+    for r, c in zip(ys, xs):
+        nc = neighbour_count[r, c]
+        if nc == 1:
+            endpoints.add((r, c))
+        elif nc >= 3:
+            junctions.add((r, c))
+
+    visited = np.zeros_like(skel, dtype=bool)
+    polylines = []
+
+    def _walk(start_r, start_c):
+        """Walk along connected skeleton pixels from a starting point."""
+        chain = [(start_r, start_c)]
+        visited[start_r, start_c] = True
+        r, c = start_r, start_c
+
+        while True:
+            found_next = False
+            for k in range(8):
+                nr, nc_ = r + dr[k], c + dc[k]
+                if (0 <= nr < rows and 0 <= nc_ < cols
+                        and skel[nr, nc_] and not visited[nr, nc_]):
+                    visited[nr, nc_] = True
+                    chain.append((nr, nc_))
+                    r, c = nr, nc_
+                    found_next = True
+                    break
+            if not found_next:
                 break
 
-        if not found:
-            break  # isolated pixel
+        return np.array(chain, dtype=np.float64)
 
-        if r == start_r and c == start_c:
-            break  # completed the loop
+    # Start from endpoints first (gives cleaner chains)
+    for r, c in endpoints:
+        if not visited[r, c]:
+            chain = _walk(r, c)
+            if len(chain) >= 2:
+                polylines.append(chain)
 
-        contour.append((r, c))
+    # Then pick up any remaining unvisited skeleton pixels (loops, etc.)
+    for r, c in zip(ys, xs):
+        if not visited[r, c]:
+            chain = _walk(r, c)
+            if len(chain) >= 2:
+                polylines.append(chain)
 
-    # Remove padding offset
-    result = np.array(contour, dtype=np.float64)
-    result -= 1.0
-    return result
+    return polylines
 
 
 def _rdp_simplify(points, tolerance):
@@ -318,13 +432,11 @@ def _rdp_simplify(points, tolerance):
     if len(points) <= 2:
         return points
 
-    # Find the point farthest from the line between first and last
     start, end = points[0], points[-1]
     line_vec = end - start
     line_len = np.linalg.norm(line_vec)
 
     if line_len < 1e-12:
-        # Degenerate: start == end, keep the farthest point
         dists = np.linalg.norm(points - start, axis=1)
         idx = np.argmax(dists)
         if dists[idx] > tolerance:
@@ -332,7 +444,6 @@ def _rdp_simplify(points, tolerance):
         return np.array([start, end])
 
     line_unit = line_vec / line_len
-    # Perpendicular distances
     vecs = points - start
     proj = vecs @ line_unit
     perp = vecs - np.outer(proj, line_unit)
@@ -344,7 +455,6 @@ def _rdp_simplify(points, tolerance):
     if max_dist <= tolerance:
         return np.array([start, end])
 
-    # Recurse on both halves
     left = _rdp_simplify(points[:max_idx + 1], tolerance)
     right = _rdp_simplify(points[max_idx:], tolerance)
 
